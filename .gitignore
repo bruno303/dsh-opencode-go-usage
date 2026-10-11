@@ -1,0 +1,8 @@
+node_modules/
+lib/
+*.log
+.DS_Store
+coverage/
+
+# Orchestrator baseline copies of source files (plan-execution scratch, not source).
+.agents/plans/snapshots/

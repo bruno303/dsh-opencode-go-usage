@@ -1,0 +1,1245 @@
+--- /dev/null
++++ src/client/usage-view.ts
+@@ -0,0 +1,340 @@
++/**
++ * Browser-half view model: the pure decisions behind {@link UsageIndicator}.
++ *
++ * React-free and DOM-free on purpose — every formatting, severity, and copy
++ * decision the widget makes is a plain function of the `UsageEnvelope` the host
++ * route returned, so it is unit-testable in a node environment with no renderer
++ * and no fetch.
++ *
++ * Copy discipline: the widget renders ONLY the fixed strings below, never a
++ * server-provided `message`. The host already keeps credentials out of its
++ * envelopes, and ignoring its free text on the client means a future host
++ * regression still cannot paint a secret into the sidebar.
++ */
++import type { QuotaWindow, UsageEnvelope, UsageFailureReason } from '../wire-types.js'
++
++/**
++ * The two host routes this half calls. Declared client-locally rather than
++ * imported from `src/route.ts`: that module is node-side code (it imports
++ * `node:http` types and the cache), and pulling it in would drag host code into
++ * the browser bundle. `usage-view.test.ts` pins both literals as a drift guard.
++ */
++export const USAGE_PATH = '/__dsh_opencode_go_usage__/usage'
++/** POST route that bypasses the host TTL (the popover's Refresh button). */
++export const REFRESH_PATH = '/__dsh_opencode_go_usage__/refresh'
++
++/** Traffic-light state for one window (or for the binding window overall). */
++export type WindowSeverity = 'ok' | 'warning' | 'critical'
++
++/** One window row in the popover. */
++export interface UsageWindowView {
++  id: string
++  label: string
++  /** Clamped, rounded percentage as display text (`19%`). */
++  percentText: string
++  severity: WindowSeverity
++  /** Compact countdown to `resetsAt` (`in 3d 4h`, `now`, `unknown`). */
++  resetsIn: string
++  limitReached: boolean
++}
++
++/** A readable snapshot. */
++export interface UsageOkView {
++  kind: 'ok'
++  label: string
++  /** `id` of the window with the highest usage, or `null` when none parsed. */
++  binding: string | null
++  /** Percentage text of the binding window, or {@link NO_WINDOW_TEXT}. */
++  percentText: string
++  severity: WindowSeverity
++  stale: boolean
++  /** Relative age of `fetchedAt` (`just now`, `4m ago`, `unknown`). */
++  fetchedAtText: string
++  windows: UsageWindowView[]
++}
++
++/** Nothing has loaded yet. */
++export interface UsageLoadingView {
++  kind: 'loading'
++}
++
++/** The read failed; `message` is fixed copy, never server text. */
++export interface UsageErrorView {
++  kind: 'error'
++  reason: UsageFailureReason
++  message: string
++  /** Server-provided HTTP status, surfaced whenever the envelope carried one. */
++  status?: number
++}
++
++/** Discriminated view model consumed by the component. */
++export type UsageView = UsageLoadingView | UsageOkView | UsageErrorView
++
++/** Shown when the snapshot parsed but has no binding window to report. */
++export const NO_WINDOW_TEXT = '—'
++
++const MINUTE_MS = 60_000
++const HOUR_MS = 3_600_000
++const DAY_MS = 86_400_000
++/** Severity flips to `warning` at four fifths of a window. */
++const WARNING_AT = 0.8
++
++/** Fixed, secret-free operator copy per failure reason. */
++const FAILURE_COPY: Record<UsageFailureReason, string> = {
++  'key-missing': 'No API key is configured for this provider.',
++  'key-invalid': 'The configured API key was rejected.',
++  'not-found': 'The usage endpoint was not found.',
++  network: 'Could not reach the usage endpoint.',
++  parse: 'The usage response could not be read.',
++  http: 'The usage endpoint returned an error.',
++}
++
++/** Every reason the wire union may carry, for runtime validation. */
++const FAILURE_REASONS: readonly UsageFailureReason[] = [
++  'key-missing',
++  'key-invalid',
++  'not-found',
++  'network',
++  'parse',
++  'http',
++]
++
++/** Fixed copy for a reason, resilient to a host that adds a new reason. */
++function failureCopy(reason: UsageFailureReason): string {
++  return FAILURE_COPY[reason] ?? FAILURE_COPY.http
++}
++
++/**
++ * Render a fraction as a whole percentage.
++ * @param percentUsed - fraction in `[0, 1]`; out-of-range and non-finite values clamp.
++ * @returns display text such as `0%`, `19%`, `100%`.
++ */
++export function formatPercent(percentUsed: number): string {
++  // A non-finite reading is a bug upstream, not a 100% window: fail down to 0
++  // so the widget can never paint an exhausted-looking state from bad math.
++  const clamped = Number.isFinite(percentUsed) ? Math.min(1, Math.max(0, percentUsed)) : 0
++  return `${String(Math.round(clamped * 100))}%`
++}
++
++/**
++ * Compact countdown to an instant.
++ * @param resetsAt - ISO-8601 reset instant.
++ * @param nowMs - current time in epoch milliseconds.
++ * @returns `in 3d 4h` / `in 5h 12m` / `in 47m` / `in 30s`, `now` once due, or `unknown` when unparseable.
++ */
++export function formatCountdown(resetsAt: string, nowMs: number): string {
++  const target = Date.parse(resetsAt)
++  if (!Number.isFinite(target)) return 'unknown'
++
++  const delta = target - nowMs
++  if (delta <= 0) return 'now'
++
++  const days = Math.floor(delta / DAY_MS)
++  const hours = Math.floor((delta % DAY_MS) / HOUR_MS)
++  const minutes = Math.floor((delta % HOUR_MS) / MINUTE_MS)
++  const seconds = Math.floor((delta % MINUTE_MS) / 1000)
++
++  // At most two units, coarse to fine: a countdown is a glance, not a clock.
++  if (days > 0) return hours > 0 ? `in ${String(days)}d ${String(hours)}h` : `in ${String(days)}d`
++  if (hours > 0) return minutes > 0 ? `in ${String(hours)}h ${String(minutes)}m` : `in ${String(hours)}h`
++  if (minutes > 0) return `in ${String(minutes)}m`
++  return `in ${String(seconds)}s`
++}
++
++/**
++ * Traffic-light state for one window.
++ * @param percentUsed - fraction in `[0, 1]`.
++ * @param limitReached - whether the provider refused the window.
++ * @returns `critical` on a refused window, `warning` at/above 80%, else `ok`.
++ */
++export function windowSeverity(percentUsed: number, limitReached: boolean): WindowSeverity {
++  if (limitReached) return 'critical'
++  return percentUsed >= WARNING_AT ? 'warning' : 'ok'
++}
++
++/** Relative age text for `fetchedAt`; mirrors {@link formatCountdown}'s coarseness. */
++function formatElapsed(fetchedAt: string, nowMs: number): string {
++  const at = Date.parse(fetchedAt)
++  if (!Number.isFinite(at)) return 'unknown'
++
++  // A clock skew that dates the snapshot in the future is not worth explaining.
++  const age = nowMs - at
++  if (age < MINUTE_MS) return 'just now'
++  if (age < HOUR_MS) return `${String(Math.floor(age / MINUTE_MS))}m ago`
++  if (age < DAY_MS) return `${String(Math.floor(age / HOUR_MS))}h ago`
++  return `${String(Math.floor(age / DAY_MS))}d ago`
++}
++
++/**
++ * Turn a host envelope into the component's view model.
++ * @param envelope - the host's envelope, or `undefined` before the first read.
++ * @param nowMs - current time in epoch milliseconds, used for the relative copy.
++ * @returns the loading view, a readable snapshot, or fixed error copy.
++ */
++export function describeEnvelope(envelope: UsageEnvelope | undefined, nowMs: number): UsageView {
++  if (envelope === undefined) return { kind: 'loading' }
++
++  if (!envelope.ok) {
++    const view: UsageErrorView = {
++      kind: 'error',
++      reason: envelope.reason,
++      message: failureCopy(envelope.reason),
++    }
++    if (envelope.status !== undefined) view.status = envelope.status
++    return view
++  }
++
++  const { snapshot } = envelope
++  const bindingWindow =
++    snapshot.binding === null
++      ? undefined
++      : snapshot.windows.find((window) => window.id === snapshot.binding)
++
++  const windows: UsageWindowView[] = snapshot.windows.map((window) => toWindowView(window, nowMs))
++
++  return {
++    kind: 'ok',
++    label: snapshot.label,
++    binding: snapshot.binding,
++    percentText: bindingWindow === undefined ? NO_WINDOW_TEXT : formatPercent(bindingWindow.percentUsed),
++    // With no binding window there is nothing to grade, so only the snapshot's
++    // own limit flag can escalate the indicator.
++    severity: windowSeverity(bindingWindow?.percentUsed ?? 0, bindingWindow?.limitReached ?? snapshot.limitReached),
++    stale: snapshot.stale,
++    fetchedAtText: formatElapsed(snapshot.fetchedAt, nowMs),
++    windows,
++  }
++}
++
++/** Project one wire window into its view row. */
++function toWindowView(window: QuotaWindow, nowMs: number): UsageWindowView {
++  return {
++    id: window.id,
++    label: window.label,
++    percentText: formatPercent(window.percentUsed),
++    severity: windowSeverity(window.percentUsed, window.limitReached),
++    resetsIn: formatCountdown(window.resetsAt, nowMs),
++    limitReached: window.limitReached,
++  }
++}
++
++/**
++ * Whether a value is structurally a `QuotaWindow`.
++ *
++ * The bundle crosses a plugin boundary a future host version also crosses, so
++ * this guards the fields the component dereferences; it is deliberately not a
++ * full schema check.
++ */
++function isQuotaWindow(value: unknown): value is QuotaWindow {
++  if (typeof value !== 'object' || value === null) return false
++  const window = value as Record<string, unknown>
++  return (
++    typeof window.id === 'string' &&
++    typeof window.label === 'string' &&
++    (window.status === 'ok' || window.status === 'rate-limited') &&
++    typeof window.percentUsed === 'number' &&
++    typeof window.resetsAt === 'string' &&
++    typeof window.limitReached === 'boolean'
++  )
++}
++
++/** Whether a value is structurally the `UsageEnvelope` the component expects. */
++function isUsageEnvelope(value: unknown): value is UsageEnvelope {
++  if (typeof value !== 'object' || value === null) return false
++  const envelope = value as Record<string, unknown>
++
++  if (envelope.ok === true) {
++    const snapshot = envelope.snapshot
++    if (typeof snapshot !== 'object' || snapshot === null) return false
++    const fields = snapshot as Record<string, unknown>
++    return (
++      typeof fields.label === 'string' &&
++      typeof fields.fetchedAt === 'string' &&
++      typeof fields.stale === 'boolean' &&
++      typeof fields.limitReached === 'boolean' &&
++      (fields.binding === null || typeof fields.binding === 'string') &&
++      Array.isArray(fields.windows) &&
++      fields.windows.every(isQuotaWindow)
++    )
++  }
++
++  if (envelope.ok === false) {
++    return typeof envelope.reason === 'string' && FAILURE_REASONS.includes(envelope.reason as UsageFailureReason)
++  }
++
++  return false
++}
++
++/** A fixed, secret-free failure envelope produced without calling the host. */
++function localFailure(reason: UsageFailureReason, status?: number): UsageEnvelope {
++  const envelope: Extract<UsageEnvelope, { ok: false }> = {
++    ok: false,
++    reason,
++    message: failureCopy(reason),
++  }
++  if (status !== undefined) envelope.status = status
++  return envelope
++}
++
++/**
++ * One authenticated same-origin read of a host route.
++ *
++ * Never throws: a rejecting `fetch`, an unreadable body, and a non-2xx status
++ * all become failure envelopes, because a plugin that throws inside an event
++ * handler takes the sidebar down with it.
++ */
++async function requestUsage(
++  fetchImpl: typeof fetch,
++  url: string,
++  method: 'GET' | 'POST',
++): Promise<UsageEnvelope> {
++  let response: Response
++  try {
++    response = await fetchImpl(url, {
++      method,
++      headers: { Accept: 'application/json' },
++      // The host authenticates the browser session with its cookie; no new
++      // transport machinery and no credential ever reaches this half.
++      credentials: 'same-origin',
++    })
++  } catch {
++    return localFailure('network')
++  }
++
++  // The host answers 200 for its own failure envelopes, so a non-2xx is a
++  // transport, admission, or routing failure rather than a quota verdict.
++  if (!response.ok) {
++    return response.status === 404 ? localFailure('not-found', 404) : localFailure('http', response.status)
++  }
++
++  let body: unknown
++  try {
++    body = await response.json()
++  } catch {
++    // A non-JSON body is an intermediary's page, not a quota reading.
++    return localFailure('network')
++  }
++
++  if (!isUsageEnvelope(body)) return localFailure('parse')
++  return body
++}
++
++/**
++ * `GET` the usage route.
++ * @param fetchImpl - fetch seam (the platform `fetch` in production).
++ * @param url - absolute or relative usage route URL.
++ * @returns the host envelope, or a local failure envelope; never rejects.
++ */
++export function fetchUsage(fetchImpl: typeof fetch, url: string): Promise<UsageEnvelope> {
++  return requestUsage(fetchImpl, url, 'GET')
++}
++
++/**
++ * `POST` the refresh route (bypasses the host TTL).
++ * @param fetchImpl - fetch seam (the platform `fetch` in production).
++ * @param url - absolute or relative refresh route URL.
++ * @returns the host envelope, or a local failure envelope; never rejects.
++ */
++export function refreshUsage(fetchImpl: typeof fetch, url: string): Promise<UsageEnvelope> {
++  return requestUsage(fetchImpl, url, 'POST')
++}
+--- /dev/null
++++ src/client/UsageIndicator.tsx
+@@ -0,0 +1,283 @@
++/**
++ * The `sidebar.footer.action` occupant: a compact quota indicator plus its
++ * detail popover.
++ *
++ * Deliberately thin. Every formatting, severity, and copy decision comes from
++ * `usage-view.ts`, so what is left here is the transport lifecycle (one load on
++ * mount, refresh on demand) and the inline-styled markup. Styling is inline and
++ * reads the shell's `--dsw-alias-*` custom properties with fallbacks: the plugin
++ * ships no CSS file and imports no UI library.
++ */
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
++import type { CSSProperties, ReactNode } from 'react'
++import type { UsageEnvelope } from '../wire-types.js'
++import {
++  describeEnvelope,
++  fetchUsage,
++  refreshUsage,
++  REFRESH_PATH,
++  USAGE_PATH,
++  type UsageView,
++  type UsageWindowView,
++  type WindowSeverity,
++} from './usage-view.js'
++
++/** Props: the slot owner share plus injection seams used by tests. */
++export interface UsageIndicatorProps {
++  /** Sidebar column state from {@link SidebarFooterActionOwnerProps}; `false` is the 56px rail. */
++  wide?: boolean
++  /** Fetch seam; defaults to the platform `fetch`. */
++  fetchImpl?: typeof fetch
++  /** Clock seam for relative copy; defaults to `Date.now`. */
++  now?: () => number
++}
++
++/** Severity colours, resolved from the shell theme with a readable fallback. */
++const SEVERITY_COLOR: Record<WindowSeverity, string> = {
++  ok: 'var(--dsw-alias-state-success-primary, #2e9e5b)',
++  warning: 'var(--dsw-alias-state-warn-primary, #d29922)',
++  critical: 'var(--dsw-alias-state-error-primary, #f85149)',
++}
++
++const MUTED = 'var(--dsw-alias-label-secondary, inherit)'
++const BORDER = 'var(--dsw-alias-border-l3, rgba(127, 127, 127, 0.35))'
++const SURFACE = 'var(--dsw-alias-bg-overlay, #1f1f23)'
++
++/** Shared text style so every popover line inherits the shell's font. */
++const TEXT: CSSProperties = { color: 'inherit', font: 'inherit', lineHeight: 1.4 }
++
++/**
++ * Bar width from the already-formatted percentage.
++ *
++ * `percentText` is `formatPercent`'s clamped `NN%` output, or the no-window
++ * placeholder when nothing parsed — so this is the one presentational number the
++ * component derives itself.
++ */
++function barWidth(percentText: string): string {
++  const value = Number.parseFloat(percentText)
++  if (!Number.isFinite(value)) return '0%'
++  return `${String(Math.min(100, Math.max(0, value)))}%`
++}
++
++/** The severity dot: the only always-visible signal in the collapsed rail. */
++function SeverityDot({ severity }: { severity: WindowSeverity }): ReactNode {
++  return (
++    <span
++      aria-hidden="true"
++      style={{
++        display: 'inline-block',
++        flex: '0 0 auto',
++        width: 8,
++        height: 8,
++        borderRadius: '50%',
++        background: SEVERITY_COLOR[severity],
++      }}
++    />
++  )
++}
++
++/** One quota window row: label, percent bar, countdown. */
++function WindowRow({ window }: { window: UsageWindowView }): ReactNode {
++  return (
++    <div style={{ display: 'grid', gap: 4, ...TEXT }}>
++      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
++        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
++          <SeverityDot severity={window.severity} />
++          <span>{window.label}</span>
++        </span>
++        <span style={{ fontVariantNumeric: 'tabular-nums' }}>{window.percentText}</span>
++      </div>
++      <div
++        style={{
++          height: 4,
++          borderRadius: 2,
++          overflow: 'hidden',
++          background: 'var(--dsw-alias-fill-tertiary, rgba(127, 127, 127, 0.25))',
++        }}
++      >
++        <div style={{ width: barWidth(window.percentText), height: '100%', background: SEVERITY_COLOR[window.severity] }} />
++      </div>
++      <div style={{ fontSize: 11, color: MUTED }}>
++        {window.limitReached ? 'limit reached · ' : ''}
++        resets {window.resetsIn}
++      </div>
++    </div>
++  )
++}
++
++/** The detail popover body. */
++function Details({ view }: { view: UsageView }): ReactNode {
++  if (view.kind === 'loading') {
++    return <div style={{ ...TEXT, color: MUTED }}>Loading usage…</div>
++  }
++
++  if (view.kind === 'error') {
++    return (
++      <div style={{ display: 'grid', gap: 6, ...TEXT }}>
++        <div>{view.message}</div>
++        {view.status === undefined ? null : (
++          <div style={{ fontSize: 11, color: MUTED }}>HTTP {view.status}</div>
++        )}
++      </div>
++    )
++  }
++
++  return (
++    <div style={{ display: 'grid', gap: 10, ...TEXT }}>
++      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
++        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
++          <SeverityDot severity={view.severity} />
++          {view.label}
++        </span>
++        <span style={{ fontVariantNumeric: 'tabular-nums' }}>{view.percentText}</span>
++      </div>
++      <div style={{ fontSize: 11, color: MUTED }}>
++        Updated {view.fetchedAtText}
++        {view.stale ? ' · stale: the last provider read failed' : ''}
++      </div>
++      {view.windows.length === 0 ? (
++        <div style={{ fontSize: 11, color: MUTED }}>No quota windows were reported.</div>
++      ) : (
++        view.windows.map((window) => <WindowRow key={window.id} window={window} />)
++      )}
++    </div>
++  )
++}
++
++/**
++ * Sidebar-foot quota indicator.
++ *
++ * @param props - owner share `wide` plus optional fetch/clock seams.
++ * @returns the indicator button and, once opened, its popover.
++ */
++export function UsageIndicator({ wide = true, fetchImpl, now }: UsageIndicatorProps): ReactNode {
++  const [envelope, setEnvelope] = useState<UsageEnvelope | undefined>(undefined)
++  const [inFlight, setInFlight] = useState(false)
++  const [open, setOpen] = useState(false)
++
++  /**
++   * Two refs guard the two ways a late response could corrupt the UI:
++   * `mounted` (never write state after unmount) and `ticket` (out-of-order
++   * responses: only the newest request may commit).
++   */
++  const mounted = useRef(true)
++  const ticket = useRef(0)
++
++  useEffect(() => {
++    mounted.current = true
++    return () => {
++      mounted.current = false
++    }
++  }, [])
++
++  const request = useCallback(
++    async (method: 'GET' | 'POST'): Promise<void> => {
++      const current = ticket.current + 1
++      ticket.current = current
++      setInFlight(true)
++      try {
++        const fetcher = fetchImpl ?? fetch
++        const result = method === 'POST' ? await refreshUsage(fetcher, REFRESH_PATH) : await fetchUsage(fetcher, USAGE_PATH)
++        if (!mounted.current || current !== ticket.current) return
++        setEnvelope(result)
++      } finally {
++        // Only the newest request clears its own spinner; a superseded one must
++        // not re-enable a button whose request is still running.
++        if (mounted.current && current === ticket.current) setInFlight(false)
++      }
++    },
++    [fetchImpl],
++  )
++
++  // Load once on mount (and again only if the fetch seam is swapped).
++  useEffect(() => {
++    void request('GET')
++  }, [request])
++
++  const view = useMemo<UsageView>(() => describeEnvelope(envelope, (now ?? Date.now)()), [envelope, now])
++
++  const accessibleName =
++    view.kind === 'ok'
++      ? `${view.label} usage: ${view.percentText}${view.stale ? ' (stale)' : ''}`
++      : view.kind === 'error'
++        ? `Usage unavailable: ${view.message}`
++        : 'Usage: loading'
++
++  return (
++    <span style={{ position: 'relative', display: 'inline-flex', ...TEXT }}>
++      <button
++        type="button"
++        aria-label={accessibleName}
++        aria-expanded={open}
++        title={accessibleName}
++        onClick={() => {
++          setOpen((wasOpen) => !wasOpen)
++        }}
++        style={{
++          display: 'inline-flex',
++          alignItems: 'center',
++          justifyContent: 'center',
++          gap: 6,
++          minWidth: 28,
++          height: 28,
++          padding: wide ? '0 8px' : 0,
++          border: 'none',
++          borderRadius: 'var(--dsw-radius-sm, 6px)',
++          background: open ? 'var(--dsw-alias-interactive-bg-hover, rgba(127, 127, 127, 0.18))' : 'transparent',
++          color: 'inherit',
++          font: 'inherit',
++          fontSize: 12,
++          cursor: 'pointer',
++        }}
++      >
++        <SeverityDot severity={view.kind === 'ok' ? view.severity : view.kind === 'error' ? 'critical' : 'ok'} />
++        {wide && view.kind === 'ok' ? <span style={{ fontVariantNumeric: 'tabular-nums' }}>{view.percentText}</span> : null}
++      </button>
++
++      {open ? (
++        <div
++          role="dialog"
++          aria-label="Usage details"
++          style={{
++            position: 'absolute',
++            right: 0,
++            bottom: 'calc(100% + 8px)',
++            zIndex: 40,
++            width: 260,
++            display: 'grid',
++            gap: 10,
++            padding: 12,
++            border: `1px solid ${BORDER}`,
++            borderRadius: 'var(--dsw-radius-md, 8px)',
++            background: SURFACE,
++            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.28)',
++            fontSize: 12,
++          }}
++        >
++          <Details view={view} />
++          <button
++            type="button"
++            disabled={inFlight}
++            onClick={() => {
++              void request('POST')
++            }}
++            style={{
++              justifySelf: 'end',
++              padding: '4px 10px',
++              border: `1px solid ${BORDER}`,
++              borderRadius: 'var(--dsw-radius-sm, 6px)',
++              background: 'transparent',
++              color: 'inherit',
++              font: 'inherit',
++              fontSize: 12,
++              cursor: inFlight ? 'default' : 'pointer',
++              opacity: inFlight ? 0.6 : 1,
++            }}
++          >
++            {inFlight ? 'Refreshing…' : 'Refresh'}
++          </button>
++        </div>
++      ) : null}
++    </span>
++  )
++}
+--- /dev/null
++++ src/client/usage-view.test.ts
+@@ -0,0 +1,428 @@
++/**
++ * Unit tests for the browser half's pure view model.
++ *
++ * No DOM and no real network: the fetch seam is always an injected fake, and
++ * `fetch`/`Response` are only *types* or the platform's in-memory `Response`
++ * implementation, so nothing here opens a socket.
++ */
++import { describe, expect, it } from 'vitest'
++import type { QuotaWindow, UsageEnvelope } from '../wire-types.js'
++import {
++  describeEnvelope,
++  fetchUsage,
++  formatCountdown,
++  formatPercent,
++  refreshUsage,
++  REFRESH_PATH,
++  USAGE_PATH,
++  windowSeverity,
++  type UsageErrorView,
++  type UsageOkView,
++} from './usage-view.js'
++
++const NOW = Date.parse('2026-10-10T12:00:00.000Z')
++const MINUTE = 60_000
++const HOUR = 60 * MINUTE
++const DAY = 24 * HOUR
++
++/** An ISO instant `offsetMs` away from {@link NOW}. */
++function at(offsetMs: number): string {
++  return new Date(NOW + offsetMs).toISOString()
++}
++
++/** One valid window. */
++function windowFixture(overrides: Partial<QuotaWindow> = {}): QuotaWindow {
++  return {
++    id: 'monthly',
++    label: 'Monthly',
++    status: 'ok',
++    percentUsed: 0.3,
++    resetsAt: at(13 * DAY),
++    limitReached: false,
++    ...overrides,
++  }
++}
++
++/** A successful envelope with the three verified windows. */
++function okEnvelope(
++  overrides: {
++    windows?: QuotaWindow[]
++    binding?: string | null
++    stale?: boolean
++    limitReached?: boolean
++    fetchedAt?: string
++  } = {},
++): Extract<UsageEnvelope, { ok: true }> {
++  return {
++    ok: true,
++    snapshot: {
++      label: 'OpenCode Go',
++      fetchedAt: overrides.fetchedAt ?? at(-4 * MINUTE),
++      stale: overrides.stale ?? false,
++      limitReached: overrides.limitReached ?? false,
++      binding: overrides.binding === undefined ? 'monthly' : overrides.binding,
++      windows: overrides.windows ?? [windowFixture()],
++    },
++  }
++}
++
++/** A fetch fake that records its calls and answers from `respond`. */
++function fakeFetch(
++  respond: (url: string, init: RequestInit | undefined) => Response,
++): { impl: typeof fetch; calls: Array<{ url: string; init: RequestInit | undefined }> } {
++  const calls: Array<{ url: string; init: RequestInit | undefined }> = []
++  const impl: typeof fetch = async (input, init) => {
++    const url = String(input)
++    calls.push({ url, init })
++    return respond(url, init)
++  }
++  return { impl, calls }
++}
++
++/** A JSON response carrying `body`. */
++function jsonResponse(body: unknown, status = 200): Response {
++  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
++}
++
++describe('route constants', () => {
++  it('matches the host routes exactly (drift guard)', () => {
++    expect(USAGE_PATH).toBe('/__dsh_opencode_go_usage__/usage')
++    expect(REFRESH_PATH).toBe('/__dsh_opencode_go_usage__/refresh')
++  })
++})
++
++describe('formatPercent', () => {
++  it('renders a fraction as a whole percentage', () => {
++    expect(formatPercent(0.19)).toBe('19%')
++    expect(formatPercent(0)).toBe('0%')
++    expect(formatPercent(1)).toBe('100%')
++  })
++
++  it('clamps out-of-range fractions', () => {
++    expect(formatPercent(-0.5)).toBe('0%')
++    expect(formatPercent(1.4)).toBe('100%')
++  })
++
++  it('rounds to the nearest integer', () => {
++    expect(formatPercent(0.194)).toBe('19%')
++    expect(formatPercent(0.195)).toBe('20%')
++    expect(formatPercent(0.196)).toBe('20%')
++    expect(formatPercent(0.005)).toBe('1%')
++  })
++
++  it('fails down to 0% on a non-finite reading', () => {
++    expect(formatPercent(Number.NaN)).toBe('0%')
++    expect(formatPercent(Number.POSITIVE_INFINITY)).toBe('0%')
++  })
++})
++
++describe('formatCountdown', () => {
++  it('renders two coarse units across days and hours', () => {
++    expect(formatCountdown(at(3 * DAY + 4 * HOUR), NOW)).toBe('in 3d 4h')
++    expect(formatCountdown(at(3 * DAY), NOW)).toBe('in 3d')
++    expect(formatCountdown(at(3 * DAY + 30 * MINUTE), NOW)).toBe('in 3d')
++  })
++
++  it('renders hours and minutes', () => {
++    expect(formatCountdown(at(5 * HOUR + 12 * MINUTE), NOW)).toBe('in 5h 12m')
++    expect(formatCountdown(at(5 * HOUR), NOW)).toBe('in 5h')
++  })
++
++  it('renders minutes alone and seconds alone', () => {
++    expect(formatCountdown(at(47 * MINUTE), NOW)).toBe('in 47m')
++    expect(formatCountdown(at(47 * MINUTE + 59_000), NOW)).toBe('in 47m')
++    expect(formatCountdown(at(30_000), NOW)).toBe('in 30s')
++    expect(formatCountdown(at(1), NOW)).toBe('in 0s')
++  })
++
++  it('reports a due or past instant as now', () => {
++    expect(formatCountdown(at(0), NOW)).toBe('now')
++    expect(formatCountdown(at(-1), NOW)).toBe('now')
++    expect(formatCountdown(at(-5 * DAY), NOW)).toBe('now')
++  })
++
++  it('reports an unparseable instant as unknown', () => {
++    expect(formatCountdown('', NOW)).toBe('unknown')
++    expect(formatCountdown('not a date', NOW)).toBe('unknown')
++  })
++})
++
++describe('windowSeverity', () => {
++  it('grades below the warning threshold as ok', () => {
++    expect(windowSeverity(0.79, false)).toBe('ok')
++    expect(windowSeverity(0, false)).toBe('ok')
++  })
++
++  it('grades at or above the threshold as warning', () => {
++    expect(windowSeverity(0.8, false)).toBe('warning')
++    expect(windowSeverity(0.95, false)).toBe('warning')
++    // Severity comes from the provider's refusal, not from the arithmetic.
++    expect(windowSeverity(1, false)).toBe('warning')
++  })
++
++  it('grades a refused window as critical regardless of percentage', () => {
++    expect(windowSeverity(0, true)).toBe('critical')
++    expect(windowSeverity(0.5, true)).toBe('critical')
++  })
++})
++
++describe('describeEnvelope', () => {
++  it('reports loading before the first read', () => {
++    expect(describeEnvelope(undefined, NOW)).toEqual({ kind: 'loading' })
++  })
++
++  it('projects a readable snapshot', () => {
++    const envelope = okEnvelope({
++      windows: [
++        windowFixture({ id: 'rolling', label: '5h', percentUsed: 0.01, resetsAt: at(13 * HOUR) }),
++        windowFixture({ id: 'weekly', label: 'Weekly', percentUsed: 0.19, resetsAt: at(2 * DAY) }),
++        windowFixture({ id: 'monthly', label: 'Monthly', percentUsed: 0.3, resetsAt: at(13 * DAY) }),
++      ],
++    })
++
++    const view = describeEnvelope(envelope, NOW)
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view).toEqual<UsageOkView>({
++      kind: 'ok',
++      label: 'OpenCode Go',
++      binding: 'monthly',
++      percentText: '30%',
++      severity: 'ok',
++      stale: false,
++      fetchedAtText: '4m ago',
++      windows: [
++        { id: 'rolling', label: '5h', percentText: '1%', severity: 'ok', resetsIn: 'in 13h', limitReached: false },
++        { id: 'weekly', label: 'Weekly', percentText: '19%', severity: 'ok', resetsIn: 'in 2d', limitReached: false },
++        { id: 'monthly', label: 'Monthly', percentText: '30%', severity: 'ok', resetsIn: 'in 13d', limitReached: false },
++      ],
++    })
++    // Readable snapshots carry no failure copy at all.
++    expect(JSON.stringify(view)).not.toContain('Could not')
++    expect(view).not.toHaveProperty('message')
++  })
++
++  it('carries the stale flag through', () => {
++    const view = describeEnvelope(okEnvelope({ stale: true }), NOW)
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view.stale).toBe(true)
++  })
++
++  it('grades the binding window high when it is the most used one', () => {
++    const view = describeEnvelope(
++      okEnvelope({
++        binding: 'rolling',
++        limitReached: true,
++        windows: [windowFixture({ id: 'rolling', label: '5h', percentUsed: 1, status: 'rate-limited', limitReached: true })],
++      }),
++      NOW,
++    )
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view.percentText).toBe('100%')
++    expect(view.severity).toBe('critical')
++    expect(view.windows[0]?.limitReached).toBe(true)
++  })
++
++  it('degrades gracefully when no window parsed', () => {
++    const view = describeEnvelope(okEnvelope({ binding: null, windows: [] }), NOW)
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view.binding).toBeNull()
++    expect(view.percentText).toBe('—')
++    expect(view.severity).toBe('ok')
++    expect(view.windows).toEqual([])
++  })
++
++  it('escalates a no-window snapshot whose limit flag is set', () => {
++    const view = describeEnvelope(okEnvelope({ binding: null, windows: [], limitReached: true }), NOW)
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view.severity).toBe('critical')
++  })
++
++  it('reports unknown relative age for an unparseable fetchedAt', () => {
++    const view = describeEnvelope(okEnvelope({ fetchedAt: 'not a date' }), NOW)
++
++    expect(view.kind).toBe('ok')
++    if (view.kind !== 'ok') throw new Error('expected an ok view')
++    expect(view.fetchedAtText).toBe('unknown')
++  })
++
++  it('maps every failure reason to fixed, human copy and surfaces the status', () => {
++    const expected: Record<string, string> = {
++      'key-missing': 'No API key is configured for this provider.',
++      'key-invalid': 'The configured API key was rejected.',
++      'not-found': 'The usage endpoint was not found.',
++      network: 'Could not reach the usage endpoint.',
++      parse: 'The usage response could not be read.',
++      http: 'The usage endpoint returned an error.',
++    }
++
++    for (const [reason, message] of Object.entries(expected)) {
++      const view = describeEnvelope(
++        { ok: false, reason: reason as UsageErrorView['reason'], status: 418, message: 'server text is ignored' },
++        NOW,
++      )
++
++      expect(view).toEqual<UsageErrorView>({ kind: 'error', reason: reason as UsageErrorView['reason'], message, status: 418 })
++    }
++  })
++
++  it('omits the status when the envelope carried none', () => {
++    const view = describeEnvelope({ ok: false, reason: 'network' }, NOW)
++
++    expect(view).toEqual<UsageErrorView>({
++      kind: 'error',
++      reason: 'network',
++      message: 'Could not reach the usage endpoint.',
++    })
++    expect(view).not.toHaveProperty('status')
++  })
++
++  it('never renders a credential-looking token from a server message', () => {
++    const SECRET = 'sk-live-abcdef0123456789'
++    const views = [
++      describeEnvelope({ ok: false, reason: 'key-invalid', status: 401, message: `Bearer ${SECRET} was rejected` }, NOW),
++      describeEnvelope({ ok: false, reason: 'key-missing', message: `credential OPENCODE_GO_API_KEY=${SECRET} is not set` }, NOW),
++      describeEnvelope({ ok: false, reason: 'network', message: `failed for ${SECRET}` }, NOW),
++      describeEnvelope({ ok: false, reason: 'parse', status: 200, message: `${SECRET}\n<html>` }, NOW),
++    ]
++
++    const rendered = JSON.stringify(views)
++    expect(rendered).not.toContain(SECRET)
++    expect(rendered).not.toMatch(/sk-[A-Za-z0-9]{8,}/)
++    expect(rendered).not.toContain('Bearer')
++  })
++})
++
++describe('fetchUsage', () => {
++  it('GETs the usage route with the Accept header and same-origin credentials', async () => {
++    const envelope = okEnvelope()
++    const { impl, calls } = fakeFetch(() => jsonResponse(envelope))
++
++    const result = await fetchUsage(impl, USAGE_PATH)
++
++    expect(result).toEqual(envelope)
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.url).toBe(USAGE_PATH)
++    expect(calls[0]?.init?.method).toBe('GET')
++    expect(calls[0]?.init?.credentials).toBe('same-origin')
++    expect(new Headers(calls[0]?.init?.headers).get('accept')).toBe('application/json')
++  })
++
++  it('passes a host failure envelope through unchanged', async () => {
++    const failure: UsageEnvelope = { ok: false, reason: 'key-missing', message: 'credential OPENCODE_GO_API_KEY is not set' }
++    const { impl } = fakeFetch(() => jsonResponse(failure))
++
++    await expect(fetchUsage(impl, USAGE_PATH)).resolves.toEqual(failure)
++  })
++
++  it('resolves a non-JSON body as a network failure', async () => {
++    const { impl } = fakeFetch(() => new Response('<html>proxy</html>', { status: 200 }))
++
++    const result = await fetchUsage(impl, USAGE_PATH)
++
++    expect(result).toEqual({ ok: false, reason: 'network', message: 'Could not reach the usage endpoint.' })
++  })
++
++  it('maps non-2xx statuses without throwing', async () => {
++    const cases: Array<{ status: number; reason: string }> = [
++      { status: 500, reason: 'http' },
++      { status: 401, reason: 'http' },
++      { status: 403, reason: 'http' },
++      { status: 405, reason: 'http' },
++      { status: 404, reason: 'not-found' },
++    ]
++
++    for (const scenario of cases) {
++      const { impl } = fakeFetch(() => new Response('denied', { status: scenario.status }))
++      const result = await fetchUsage(impl, USAGE_PATH)
++
++      expect(result).toEqual({
++        ok: false,
++        reason: scenario.reason,
++        status: scenario.status,
++        message: scenario.reason === 'not-found' ? 'The usage endpoint was not found.' : 'The usage endpoint returned an error.',
++      })
++    }
++  })
++
++  it('resolves a rejecting fetch as a network failure', async () => {
++    const impl: typeof fetch = async () => {
++      throw new Error('connect ECONNREFUSED 127.0.0.1:3080')
++    }
++
++    const result = await fetchUsage(impl, USAGE_PATH)
++
++    expect(result).toEqual({ ok: false, reason: 'network', message: 'Could not reach the usage endpoint.' })
++    expect(JSON.stringify(result)).not.toContain('ECONNREFUSED')
++  })
++
++  it('resolves a drifted JSON shape as a parse failure', async () => {
++    const { impl } = fakeFetch(() => jsonResponse({ ok: true, snapshot: { label: 'x', fetchedAt: 'y', stale: false, limitReached: false, binding: null, windows: [null] } }))
++
++    await expect(fetchUsage(impl, USAGE_PATH)).resolves.toEqual({
++      ok: false,
++      reason: 'parse',
++      message: 'The usage response could not be read.',
++    })
++  })
++
++  it('never throws for any transport outcome', async () => {
++    const bodies: Array<() => Response> = [
++      () => jsonResponse(okEnvelope()),
++      () => jsonResponse({ ok: false, reason: 'http', status: 500 }),
++      () => new Response('nope', { status: 503 }),
++      () => new Response(null, { status: 204 }),
++    ]
++
++    for (const body of bodies) {
++      const { impl } = fakeFetch(body)
++      await expect(fetchUsage(impl, USAGE_PATH)).resolves.toHaveProperty('ok')
++    }
++  })
++})
++
++describe('refreshUsage', () => {
++  it('POSTs the refresh route with the same headers', async () => {
++    const envelope = okEnvelope({ stale: true })
++    const { impl, calls } = fakeFetch(() => jsonResponse(envelope))
++
++    const result = await refreshUsage(impl, REFRESH_PATH)
++
++    expect(result).toEqual(envelope)
++    expect(calls[0]?.url).toBe(REFRESH_PATH)
++    expect(calls[0]?.init?.method).toBe('POST')
++    expect(calls[0]?.init?.credentials).toBe('same-origin')
++    expect(new Headers(calls[0]?.init?.headers).get('accept')).toBe('application/json')
++  })
++
++  it('resolves a rejecting fetch as a network failure', async () => {
++    const impl: typeof fetch = async () => {
++      throw new Error('offline')
++    }
++
++    await expect(refreshUsage(impl, REFRESH_PATH)).resolves.toEqual({
++      ok: false,
++      reason: 'network',
++      message: 'Could not reach the usage endpoint.',
++    })
++  })
++
++  it('maps a non-JSON body as a network failure', async () => {
++    const { impl } = fakeFetch(() => new Response('not json', { status: 200 }))
++
++    await expect(refreshUsage(impl, REFRESH_PATH)).resolves.toEqual({
++      ok: false,
++      reason: 'network',
++      message: 'Could not reach the usage endpoint.',
++    })
++  })
++})
+--- a/src/client/index.tsx
++++ b/src/client/index.tsx
+@@ -1,5 +1,3 @@
+-import type { Context } from '@deepseek-ai/cordis'
+-
+ /**
+  * Browser half of `dsh-opencode-go-usage`.
+  *
+@@ -7,21 +5,74 @@
+  * (see `scripts/wrap-client.mjs`). The only modules this half may `require` are
+  * the platform-baseline ones (`react`, `react/jsx-runtime`), which is why the
+  * build externalises exactly those two.
++ *
++ * The `slots` service is typed structurally here rather than imported from
++ * `@deepseek-ai/dsh-client-ui-slots`: importing it would pull a `@deepseek-ai/*`
++ * package into browser code (only `react` / `react/jsx-runtime` are resolvable
++ * there). The field set below was verified against the installed contracts
++ * (`0.2.0-rc.2`) — `BaseOptions` in `dsh-client-ui-slots/lib/types/index.d.ts`
++ * supplies `name` plus the list-kind `id` / `order` / `label`, and
++ * `SlotRegistry.inject` in `dsh-client-ui-renderer/lib/types/client/registry.d.ts`
++ * is the declaration-aware registration doorway.
+  */
++import type { ReactNode } from 'react'
++import { UsageIndicator } from './UsageIndicator.js'
+ 
+ /** Service the browser half needs to register into a slot. */
+ export const inject = ['slots']
+ 
++/** Registration id: the package name, so a diagnostic names the owner. */
++const PLUGIN_ID = 'dsh-opencode-go-usage'
++/** The declared list slot at the sidebar foot (`SidebarFooterActionOwnerProps`). */
++const SLOT = 'sidebar.footer.action'
++/** Ascending list order; leaves room for occupants ordered before and after. */
++const ORDER = 100
++
++/** The `register` option shape for a `list` slot (see module doc). */
++interface SlotRegistrationOptions {
++  name: string
++  id: string
++  order?: number
++  label?: string
++}
++
++/** One registration's disposer. */
++type SlotDisposer = () => void
++
++/** The slice of `SlotRegistry` this half uses. */
++interface SlotsServiceLike {
++  register(options: SlotRegistrationOptions, component: (props: { wide: boolean }) => ReactNode): SlotDisposer
++  inject(key: string, callback: () => SlotDisposer): SlotDisposer
++}
++
++/** The slice of the client plugin context this half uses. */
++interface ClientContext {
++  slots: SlotsServiceLike
++}
++
+ /**
+  * Cordis entry point for the browser half.
+  *
+- * Task 1 stub: it intentionally registers nothing yet. Task 3 adds the
+- * `UsageIndicator` registration into the `sidebar.footer.action` slot declared
+- * by `@deepseek-ai/dsh-client-ui-sidebar`.
++ * Registers {@link UsageIndicator} into `sidebar.footer.action` through
++ * `ctx.slots.inject`, which is the installed API's declaration-aware doorway:
++ * the callback runs as soon as (or as late as) `ui-sidebar` declares the slot,
++ * and it re-runs if the declaration collapses and returns. That matters because
++ * plugin load order is the loader's business, and a bare `register` into a
++ * not-yet-declared slot throws at activation.
++ *
++ * Disposal: `SlotRegistry.register` is a prototype method whose cordis service
++ * proxy binds `this.ctx` to the caller's fiber, so the entry is disposed on
++ * plugin unload; `inject` adds its own fiber-owned, idempotent wait disposer on
++ * top. No `ctx.effect` wrapper is needed — wrapping would register the same
++ * lifetime twice for no gain.
+  *
+  * @param ctx - the client plugin context (injects `slots`).
+  */
+-export function apply(ctx: Context): void {
+-  // Stub: no slot registration yet.
+-  void ctx
++export function apply(ctx: ClientContext): void {
++  ctx.slots.inject(SLOT, () =>
++    ctx.slots.register(
++      { name: SLOT, id: PLUGIN_ID, order: ORDER, label: 'OpenCode Go usage' },
++      UsageIndicator,
++    ),
++  )
+ }
+--- a/src/route.ts
++++ b/src/route.ts
+@@ -134,19 +134,22 @@
+   }
+ 
+   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+-    // Admission first: an unauthenticated request must never reach the provider
+-    // or the cache, and the refusal is passed through verbatim.
+-    const admitted = deps.admit(req)
+-    if ('rejection' in admitted) {
+-      const status = admitted.rejection
+-      sendJson(res, status, { ok: false, reason: 'http', status })
+-      return
+-    }
++    try {
++      // Admission first: an unauthenticated request must never reach the
++      // provider or the cache, and the refusal is passed through verbatim.
++      // Inside the try like everything else, because a throw from `admit` is
++      // still an unexpected internal failure — it must become the fixed,
++      // secret-free 500 below rather than escape the handler with its message.
++      const admitted = deps.admit(req)
++      if ('rejection' in admitted) {
++        const status = admitted.rejection
++        sendJson(res, status, { ok: false, reason: 'http', status })
++        return
++      }
+ 
+-    const method = (req.method ?? 'GET').toUpperCase()
+-    const path = pathnameOf(req.url)
++      const method = (req.method ?? 'GET').toUpperCase()
++      const path = pathnameOf(req.url)
+ 
+-    try {
+       if (path === USAGE_ROUTE) {
+         if (method !== 'GET') {
+           methodNotAllowed(res, 'GET')
+--- a/src/cache.ts
++++ b/src/cache.ts
+@@ -111,11 +111,16 @@
+     if (result.reason === 'network' || result.reason === 'parse') {
+       const previous = cached
+       if (previous === undefined) return result
+-      // Keep serving the last good reading, marked stale; leave `storedAt`
+-      // untouched so the next request retries the provider instead of treating
+-      // the stale copy as fresh for another whole TTL.
++      // Keep serving the last good reading, marked stale. Its TTL window is
++      // expired explicitly rather than left alone: a *forced* refresh that
++      // fails inside the previous snapshot's TTL would otherwise leave
++      // `isFresh()` true and every later GET would keep re-serving the stale
++      // copy until the original TTL ran out. Backdating the stored timestamp
++      // makes the next unforced load retry the provider immediately while the
++      // stale snapshot stays readable.
+       const stale: CachedEnvelope = { ok: true, snapshot: { ...previous.snapshot, stale: true } }
+       cached = stale
++      storedAt = now() - ttlMs
+       return stale
+     }
+ 
+--- a/src/cache.test.ts
++++ b/src/cache.test.ts
+@@ -176,6 +176,35 @@
+     expect(result.snapshot.stale).toBe(true)
+   })
+ 
++  it('expires the TTL when a failed forced refresh serves a stale reading inside the window', async () => {
++    const cache = makeCache({ ttlMs: 1000 })
++    const good = ok('2026-10-10T00:00:00.000Z', 40)
++    cache.set(good)
++    clock = 100
++
++    // The previous snapshot is genuinely fresh before the forced attempt.
++    expect(cache.isFresh()).toBe(true)
++
++    const failure: UsageEnvelope = { ok: false, reason: 'network', message: 'provider request failed (network or timeout)' }
++    const result = await cache.load(async () => failure, { force: true })
++
++    // The stale copy is still what gets served...
++    expect(result).toEqual({ ok: true, snapshot: { ...good.snapshot, stale: true } })
++    if (!result.ok) throw new Error('expected the stale reading to be served')
++    expect(result.snapshot.fetchedAt).toBe(good.snapshot.fetchedAt)
++    expect(cache.get()?.snapshot.stale).toBe(true)
++    // ...but it must not keep the failed attempt's TTL window alive.
++    expect(cache.isFresh()).toBe(false)
++
++    // A later GET therefore retries the provider instead of re-serving it.
++    const loader = counting(ok('2026-10-10T05:00:00.000Z', 60))
++    const retried = await cache.load(loader.load)
++    expect(loader.calls()).toBe(1)
++    expect(retried.ok).toBe(true)
++    if (!retried.ok) throw new Error('expected the reload to succeed')
++    expect(retried.snapshot.stale).toBe(false)
++  })
++
+   it('propagates a transport failure when there is no previous reading', async () => {
+     const cache = makeCache()
+     const failure: UsageEnvelope = { ok: false, reason: 'network', message: 'provider request failed (network or timeout)' }

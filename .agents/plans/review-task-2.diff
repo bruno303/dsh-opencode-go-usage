@@ -1,0 +1,1903 @@
+--- /dev/null
++++ src/quota-parse.ts
+@@ -0,0 +1,126 @@
++/**
++ * Pure validator/parser for the OpenCode Go `GET /zen/go/v1/usage` payload.
++ *
++ * The upstream endpoint is official but undocumented, so this module is
++ * deliberately lenient: individual windows that drift out of shape are DROPPED,
++ * not treated as fatal, because one renamed or newly added window must not take
++ * the whole widget down. The read is only a `parse` failure when there is no
++ * usable `usage` object or when not a single window survives validation.
++ *
++ * Safety rules (see `docs/opencode-go-usage-api.md`):
++ * - a window is valid only when `status ∈ {ok, rate-limited}`, `percent` is a
++ *   finite number in `[0, 100]`, and `resetsAt` is a non-empty string whose
++ *   `Date.parse` is finite;
++ * - `percentUsed = status === 'rate-limited' ? 1 : percent / 100`;
++ * - `limitReached = status === 'rate-limited' || percent === 100`.
++ *
++ * Pure: no I/O, no imports beyond the shared wire types, never throws.
++ */
++import type { QuotaWindow, QuotaWindowStatus } from './wire-types.js'
++
++/** Result of {@link parseUsagePayload}. */
++export type ParseUsageResult =
++  | {
++      ok: true
++      windows: QuotaWindow[]
++      /** `id` of the window with the highest `percentUsed`, or `null` when none parsed. */
++      binding: string | null
++      /** True when at least one window is exhausted. */
++      limitReached: boolean
++    }
++  | { ok: false; reason: 'parse'; message: string }
++
++/** One provider window key plus the label the widget shows for it. */
++interface WindowSpec {
++  readonly key: string
++  readonly label: string
++}
++
++/**
++ * The only provider keys we understand, ordered by horizon (shortest first).
++ *
++ * The order is load-bearing: the binding scan below uses a strict `>` so an
++ * equal `percentUsed` keeps the earlier — shorter — window, which is the
++ * documented tie-break (`rolling` > `weekly` > `monthly`).
++ */
++const WINDOW_SPECS: readonly WindowSpec[] = [
++  { key: 'rolling', label: '5h' },
++  { key: 'weekly', label: 'Weekly' },
++  { key: 'monthly', label: 'Monthly' },
++]
++
++/** Message shared by every parse failure; it carries no payload content. */
++const PARSE_MESSAGE = 'response carried no usable usage windows'
++
++/** Narrow `unknown` to a plain (non-array, non-null) object. */
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++}
++
++/**
++ * Validate one raw provider window and normalise it.
++ * @param spec - the provider key and widget label for this window.
++ * @param raw - the raw field value from the payload.
++ * @returns the normalised window, or `undefined` when it must be dropped.
++ */
++function normaliseWindow(spec: WindowSpec, raw: unknown): QuotaWindow | undefined {
++  if (!isRecord(raw)) return undefined
++
++  const status = raw.status
++  if (status !== 'ok' && status !== 'rate-limited') return undefined
++
++  const percent = raw.percent
++  if (typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100) {
++    return undefined
++  }
++
++  const resetsAt = raw.resetsAt
++  if (typeof resetsAt !== 'string' || resetsAt.trim() === '') return undefined
++  if (!Number.isFinite(Date.parse(resetsAt))) return undefined
++
++  const resolved: QuotaWindowStatus = status
++  return {
++    id: spec.key,
++    label: spec.label,
++    status: resolved,
++    // `rate-limited` means exhausted regardless of the reported percent.
++    percentUsed: resolved === 'rate-limited' ? 1 : percent / 100,
++    resetsAt,
++    limitReached: resolved === 'rate-limited' || percent === 100,
++  }
++}
++
++/**
++ * Parse a decoded provider payload into normalised quota windows.
++ * @param payload - the JSON-decoded body (any shape; never trusted).
++ * @returns the windows plus the binding window, or a `parse` failure envelope.
++ */
++export function parseUsagePayload(payload: unknown): ParseUsageResult {
++  if (!isRecord(payload)) return { ok: false, reason: 'parse', message: PARSE_MESSAGE }
++
++  const usage = payload.usage
++  if (!isRecord(usage)) return { ok: false, reason: 'parse', message: PARSE_MESSAGE }
++
++  const windows: QuotaWindow[] = []
++  let binding: string | null = null
++  let bindingUsed = -1
++  let limitReached = false
++
++  // Iterate only the three known keys, shortest horizon first (tie-break order).
++  for (const spec of WINDOW_SPECS) {
++    const window = normaliseWindow(spec, usage[spec.key])
++    if (window === undefined) continue
++
++    windows.push(window)
++    if (window.limitReached) limitReached = true
++    // Strict `>` keeps the earlier (shorter) window on a tie.
++    if (window.percentUsed > bindingUsed) {
++      bindingUsed = window.percentUsed
++      binding = window.id
++    }
++  }
++
++  if (windows.length === 0) return { ok: false, reason: 'parse', message: PARSE_MESSAGE }
++
++  return { ok: true, windows, binding, limitReached }
++}
+--- /dev/null
++++ src/quota-provider.ts
+@@ -0,0 +1,120 @@
++/**
++ * Authenticated fetch of the OpenCode Go quota endpoint, classified into the
++ * shared {@link UsageEnvelope} shape.
++ *
++ * Secret safety is the whole point of this module's error handling: the key
++ * travels only in the request's `Authorization` header, and every `message`
++ * written into a failure envelope is a fixed, safe phrase (or the upstream
++ * status code). The key, the `Authorization` header, and the raw response body
++ * must never reach a message, a log line, or a response body.
++ *
++ * Network access is injectable (`fetchImpl`) so tests never touch the wire, and
++ * the clock is injectable (`now`) so `fetchedAt` is deterministic under test.
++ */
++import packageJson from '../package.json' with { type: 'json' }
++import type { UsageEnvelope } from './wire-types.js'
++import { parseUsagePayload } from './quota-parse.js'
++
++/** Everything {@link fetchQuota} needs; `fetchImpl` and `now` are test seams. */
++export interface FetchQuotaDeps {
++  /** Absolute quota endpoint URL. */
++  url: string
++  /** Credential value; sent only as `Authorization: Bearer <key>`. */
++  apiKey: string
++  /** Per-request deadline in milliseconds. */
++  timeoutMs: number
++  /** Display label copied into the snapshot. */
++  label: string
++  /** Fetch implementation; defaults to the global `fetch`. */
++  fetchImpl?: typeof fetch
++  /** Clock in epoch milliseconds; defaults to `Date.now`. */
++  now?: () => number
++}
++
++/**
++ * `User-Agent` value. The version is read from the package manifest so a
++ * release bump cannot leave the header stale.
++ */
++export const USER_AGENT = `${packageJson.name}/${packageJson.version}`
++
++/**
++ * Perform one authenticated quota read.
++ * @param deps - url, key, deadline, label, and the optional test seams.
++ * @returns a success envelope, or a classified failure envelope free of secrets.
++ */
++export async function fetchQuota(deps: FetchQuotaDeps): Promise<UsageEnvelope> {
++  const fetchImpl = deps.fetchImpl ?? fetch
++  const now = deps.now ?? Date.now
++
++  let response: Response
++  try {
++    response = await fetchImpl(deps.url, {
++      method: 'GET',
++      headers: {
++        Authorization: `Bearer ${deps.apiKey}`,
++        Accept: 'application/json',
++        'User-Agent': USER_AGENT,
++      },
++      // AbortSignal.timeout covers both the connect and the body read; a thrown
++      // RangeError for a nonsense deadline lands in the same catch as a timeout.
++      signal: AbortSignal.timeout(deps.timeoutMs),
++    })
++  } catch {
++    return {
++      ok: false,
++      reason: 'network',
++      message: 'provider request failed (network or timeout)',
++    }
++  }
++
++  if (response.status === 401 || response.status === 403) {
++    return {
++      ok: false,
++      reason: 'key-invalid',
++      status: response.status,
++      message: `provider rejected the credential (${response.status})`,
++    }
++  }
++
++  if (response.status === 404) {
++    return {
++      ok: false,
++      reason: 'not-found',
++      status: 404,
++      // The URL itself is operator configuration; name the field instead of
++      // echoing a value that may carry deployment-specific path segments.
++      message: 'usage endpoint not found (404); check the configured usageUrl',
++    }
++  }
++
++  if (!response.ok) {
++    return {
++      ok: false,
++      reason: 'http',
++      status: response.status,
++      message: `provider returned HTTP ${response.status}`,
++    }
++  }
++
++  let body: unknown
++  try {
++    body = await response.json()
++  } catch {
++    return { ok: false, reason: 'parse', message: 'provider returned a non-JSON body' }
++  }
++
++  const parsed = parseUsagePayload(body)
++  if (!parsed.ok) return { ok: false, reason: 'parse', message: parsed.message }
++
++  return {
++    ok: true,
++    snapshot: {
++      label: deps.label,
++      fetchedAt: new Date(now()).toISOString(),
++      stale: false,
++      limitReached: parsed.limitReached,
++      binding: parsed.binding,
++      windows: parsed.windows,
++    },
++  }
++}
+--- /dev/null
++++ src/cache.ts
+@@ -0,0 +1,166 @@
++/**
++ * TTL snapshot cache with single-flight loading and a refresh floor.
++ *
++ * Three behaviors this module exists to guarantee:
++ *
++ * 1. **Single-flight** — concurrent callers share one provider request, so a
++ *    burst of browser polls never multiplies upstream load.
++ * 2. **Stale-on-transport-failure** — when a reload fails for a reason that may
++ *    be transient (`network`, `parse`), the last good reading is still served
++ *    with `stale: true`, so a blip never blanks the widget.
++ * 3. **Fail-closed on credential failure** — `key-missing`/`key-invalid` clears
++ *    the cache and propagates the failure instead of serving a reading that the
++ *    provider has already refused.
++ *
++ * The clock is injected so every boundary (TTL edge, refresh floor) is testable
++ * without timers, and the module is pure: no I/O, no `node:http`, no Cordis.
++ */
++import type { UsageEnvelope } from './wire-types.js'
++
++/** The cached shape: only successful readings are ever stored. */
++export type CachedEnvelope = Extract<UsageEnvelope, { ok: true }>
++
++/** One loaded envelope; a cache that never stored a success has none. */
++export interface SnapshotCache {
++  /** The last good reading, or `undefined` when nothing successful is cached. */
++  get(): CachedEnvelope | undefined
++  /** Whether {@link get} is still inside the TTL window. */
++  isFresh(): boolean
++  /** Store a good reading and restart its TTL window. */
++  set(envelope: CachedEnvelope): void
++  /**
++   * Drop the stored reading. Does NOT reset the refresh floor: a credential
++   * failure that clears the cache must not unlock immediate retry hammering.
++   */
++  clear(): void
++  /** Milliseconds since the stored reading was stored, or `undefined` when empty. */
++  ageMs(): number | undefined
++  /** Whether the refresh floor has elapsed since the last provider load started. */
++  canForceRefresh(): boolean
++  /**
++   * Serve the cached reading when fresh, otherwise run `loader`.
++   * @param loader - provider load; its failure envelope drives the stale/clear rules.
++   * @param options - `force: true` bypasses the TTL check.
++   */
++  load(
++    loader: () => Promise<UsageEnvelope>,
++    options?: { readonly force?: boolean },
++  ): Promise<UsageEnvelope>
++}
++
++/** Construction options for {@link createSnapshotCache}. */
++export interface SnapshotCacheOptions {
++  /** How long a good reading is served before another provider load. */
++  ttlMs: number
++  /** Anti-spam floor between forced refreshes. @default 5000 */
++  minRefreshMs?: number
++  /** Clock in epoch milliseconds. @default Date.now */
++  now?: () => number
++}
++
++/** Default anti-spam floor between forced refreshes (PLAN.md §4). */
++export const DEFAULT_MIN_REFRESH_MS = 5000
++
++/**
++ * Create a snapshot cache.
++ * @param options - TTL, optional refresh floor, optional clock.
++ * @returns the cache instance.
++ */
++export function createSnapshotCache(options: SnapshotCacheOptions): SnapshotCache {
++  const now = options.now ?? Date.now
++  const ttlMs = options.ttlMs
++  const minRefreshMs = options.minRefreshMs ?? DEFAULT_MIN_REFRESH_MS
++
++  let cached: CachedEnvelope | undefined
++  let storedAt: number | undefined
++  let lastLoadStartedAt: number | undefined
++  let inFlight: Promise<UsageEnvelope> | undefined
++
++  function ageMs(): number | undefined {
++    if (cached === undefined || storedAt === undefined) return undefined
++    return now() - storedAt
++  }
++
++  function isFresh(): boolean {
++    const age = ageMs()
++    // Strict `<`: a reading is no longer fresh exactly at its TTL boundary.
++    return age !== undefined && age < ttlMs
++  }
++
++  function canForceRefresh(): boolean {
++    if (lastLoadStartedAt === undefined) return true
++    return now() - lastLoadStartedAt >= minRefreshMs
++  }
++
++  async function runLoad(loader: () => Promise<UsageEnvelope>): Promise<UsageEnvelope> {
++    let result: UsageEnvelope
++    try {
++      result = await loader()
++    } catch {
++      // A loader that throws is indistinguishable from a transport failure, and
++      // its message is not safe to surface.
++      result = { ok: false, reason: 'network', message: 'quota load failed' }
++    }
++
++    if (result.ok) {
++      cached = result
++      storedAt = now()
++      return result
++    }
++
++    if (result.reason === 'network' || result.reason === 'parse') {
++      const previous = cached
++      if (previous === undefined) return result
++      // Keep serving the last good reading, marked stale; leave `storedAt`
++      // untouched so the next request retries the provider instead of treating
++      // the stale copy as fresh for another whole TTL.
++      const stale: CachedEnvelope = { ok: true, snapshot: { ...previous.snapshot, stale: true } }
++      cached = stale
++      return stale
++    }
++
++    if (result.reason === 'key-missing' || result.reason === 'key-invalid') {
++      // The provider has refused this credential: the cached reading is for a
++      // key that no longer applies. Drop it rather than show a stale copy.
++      cached = undefined
++      storedAt = undefined
++      return result
++    }
++
++    // `not-found` and `http`: a configuration/upstream problem. Propagate the
++    // failure but keep the last good reading so a later network failure can
++    // still serve it as stale.
++    return result
++  }
++
++  return {
++    get: () => cached,
++    isFresh,
++    set: (envelope) => {
++      cached = envelope
++      storedAt = now()
++    },
++    clear: () => {
++      cached = undefined
++      storedAt = undefined
++    },
++    ageMs,
++    canForceRefresh,
++    load: (loader, loadOptions) => {
++      const force = loadOptions?.force === true
++      if (!force && isFresh() && cached !== undefined) return Promise.resolve(cached)
++      if (inFlight !== undefined) return inFlight
++
++      lastLoadStartedAt = now()
++      const pending = runLoad(loader)
++      inFlight = pending
++      const settle = (): void => {
++        // Identity-checked so a later load's in-flight promise is never cleared
++        // by an earlier one settling late.
++        if (inFlight === pending) inFlight = undefined
++      }
++      pending.then(settle, settle)
++      return pending
++    },
++  }
++}
+--- /dev/null
++++ src/route.ts
+@@ -0,0 +1,177 @@
++/**
++ * The authenticated HTTP handler behind both quota routes.
++ *
++ * This module is the test seam for the host half: {@link createUsageHandler}
++ * takes its cache, provider loader, and request admission as arguments, so a
++ * test drives the whole request lifecycle with fakes and never starts the DSH
++ * runtime or touches the network. Only `node:http` TYPES are imported; the
++ * runtime needs nothing beyond the `Buffer` global.
++ *
++ * Response contract:
++ * - `GET  USAGE_ROUTE`   — serve the cache (fresh reading, else load).
++ * - `POST REFRESH_ROUTE` — force a reload when the refresh floor allows it,
++ *                          otherwise answer with the current reading.
++ * - any other method     — `405` with an `Allow` header naming the supported one.
++ *
++ * Every response is JSON with an explicit `Content-Length`; quota data is
++ * `no-store` (it is per-operator and must not be cached by a proxy). Bodies
++ * carry only safe facts: never the credential, never the raw upstream body.
++ */
++import type { IncomingMessage, ServerResponse } from 'node:http'
++import type { PeerAdmission } from '@deepseek-ai/dsh-client-connection'
++import type { CachedEnvelope, SnapshotCache } from './cache.js'
++import type { UsageEnvelope } from './wire-types.js'
++
++/**
++ * Exact route paths. Deliberately NOT under `/api`, which the connection bridge
++ * owns; the webserver throws on a duplicate (kind, path), so a collision is a
++ * loud load failure instead of a silent hijack.
++ */
++export const USAGE_ROUTE = '/__dsh_opencode_go_usage__/usage'
++/** The refresh route (POST). */
++export const REFRESH_ROUTE = '/__dsh_opencode_go_usage__/refresh'
++
++/** Everything the handler needs; every field is injectable for tests. */
++export interface UsageHandlerDeps {
++  /** TTL cache shared by both routes. */
++  cache: SnapshotCache
++  /** Provider load (credential resolve + fetch); the cache applies stale rules. */
++  loadEnvelope: () => Promise<UsageEnvelope>
++  /** Browser-trust admission; a refusal must never reach the provider or cache. */
++  admit: (req: IncomingMessage) => PeerAdmission
++  /** Clock used only to report the served snapshot's age. @default Date.now */
++  now?: () => number
++}
++
++/** Header value for the widget's "updated N ago" affordance. */
++const AGE_HEADER = 'X-Usage-Snapshot-Age-Ms'
++
++/** Pathname of a node request URL, without query or hash. */
++function pathnameOf(url: string | undefined): string {
++  const raw = url ?? ''
++  const cut = raw.search(/[?#]/)
++  return cut === -1 ? raw : raw.slice(0, cut)
++}
++
++/**
++ * Write one JSON response with an explicit length.
++ * @param res - the response to own.
++ * @param status - HTTP status code.
++ * @param body - JSON-serialisable payload (never carries a secret).
++ * @param headers - extra response headers (`Allow`, the age header, …).
++ */
++function sendJson(
++  res: ServerResponse,
++  status: number,
++  body: unknown,
++  headers?: Readonly<Record<string, string>>,
++): void {
++  const payload = JSON.stringify(body)
++  res.writeHead(status, {
++    'Content-Type': 'application/json; charset=utf-8',
++    'Content-Length': String(Buffer.byteLength(payload, 'utf8')),
++    'Cache-Control': 'no-store',
++    ...headers,
++  })
++  res.end(payload)
++}
++
++/** The age header for a snapshot-bearing response, when `fetchedAt` parses. */
++function ageHeader(envelope: CachedEnvelope, now: () => number): Record<string, string> {
++  const fetchedAt = Date.parse(envelope.snapshot.fetchedAt)
++  if (!Number.isFinite(fetchedAt)) return {}
++  return { [AGE_HEADER]: String(Math.max(0, now() - fetchedAt)) }
++}
++
++/**
++ * Build the handler for both quota routes.
++ * @param deps - cache, provider loader, admission, optional clock.
++ * @returns the `(req, res)` handler registered for {@link USAGE_ROUTE} and {@link REFRESH_ROUTE}.
++ */
++export function createUsageHandler(deps: UsageHandlerDeps): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
++  const now = deps.now ?? Date.now
++
++  async function serve(res: ServerResponse, force: boolean): Promise<void> {
++    if (!force && deps.cache.isFresh()) {
++      const cached = deps.cache.get()
++      if (cached !== undefined) {
++        sendJson(res, 200, cached, ageHeader(cached, now))
++        return
++      }
++    }
++
++    if (force && !deps.cache.canForceRefresh()) {
++      const cached = deps.cache.get()
++      if (cached !== undefined) {
++        sendJson(res, 200, cached, ageHeader(cached, now))
++        return
++      }
++      // Nothing successful has ever loaded and the floor forbids a provider
++      // call. Report the throttle rather than silently doing nothing.
++      sendJson(res, 200, {
++        ok: false,
++        reason: 'http',
++        message: 'refresh is throttled; no reading is available yet',
++      })
++      return
++    }
++
++    const envelope = await deps.cache.load(deps.loadEnvelope, force ? { force: true } : undefined)
++    if (envelope.ok) {
++      sendJson(res, 200, envelope, ageHeader(envelope, now))
++      return
++    }
++    sendJson(res, 200, envelope)
++  }
++
++  function methodNotAllowed(res: ServerResponse, allowed: string): void {
++    sendJson(
++      res,
++      405,
++      { ok: false, reason: 'http', status: 405, message: 'method not allowed' },
++      { Allow: allowed },
++    )
++  }
++
++  return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
++    // Admission first: an unauthenticated request must never reach the provider
++    // or the cache, and the refusal is passed through verbatim.
++    const admitted = deps.admit(req)
++    if ('rejection' in admitted) {
++      const status = admitted.rejection
++      sendJson(res, status, { ok: false, reason: 'http', status })
++      return
++    }
++
++    const method = (req.method ?? 'GET').toUpperCase()
++    const path = pathnameOf(req.url)
++
++    try {
++      if (path === USAGE_ROUTE) {
++        if (method !== 'GET') {
++          methodNotAllowed(res, 'GET')
++          return
++        }
++        await serve(res, false)
++        return
++      }
++
++      if (path === REFRESH_ROUTE) {
++        if (method !== 'POST') {
++          methodNotAllowed(res, 'POST')
++          return
++        }
++        await serve(res, true)
++        return
++      }
++
++      sendJson(res, 404, { ok: false, reason: 'http', status: 404, message: 'unknown route' })
++    } catch {
++      // An unexpected throw could carry arbitrary text; answer with a fixed
++      // message so no internal detail (let alone a credential) can escape.
++      if (res.headersSent !== true) {
++        sendJson(res, 500, { ok: false, reason: 'http', status: 500, message: 'internal error' })
++      }
++    }
++  }
++}
+--- /dev/null
++++ src/quota-parse.test.ts
+@@ -0,0 +1,286 @@
++import { describe, expect, it } from 'vitest'
++import { parseUsagePayload, type ParseUsageResult } from './quota-parse.js'
++
++/** Narrow to the success arm or fail loudly. */
++function expectOk(result: ParseUsageResult): Extract<ParseUsageResult, { ok: true }> {
++  if (!result.ok) throw new Error(`expected a successful parse, got: ${result.message}`)
++  return result
++}
++
++/** A valid window payload with the given overrides. */
++function window(overrides: Record<string, unknown> = {}): Record<string, unknown> {
++  return { status: 'ok', percent: 50, resetsAt: '2026-10-11T01:21:36.000Z', ...overrides }
++}
++
++/** The verified live shape (values from the 2026-10-10 call). */
++const LIVE_PAYLOAD = {
++  usage: {
++    rolling: { status: 'ok', percent: 1, resetsAt: '2026-10-11T01:21:36.000Z' },
++    weekly: { status: 'ok', percent: 19, resetsAt: '2026-10-12T00:00:00.000Z' },
++    monthly: { status: 'ok', percent: 30, resetsAt: '2026-10-23T21:44:23.000Z' },
++  },
++}
++
++describe('parseUsagePayload', () => {
++  it('parses the verified three-window payload in provider order', () => {
++    const result = expectOk(parseUsagePayload(LIVE_PAYLOAD))
++
++    expect(result.windows).toEqual([
++      {
++        id: 'rolling',
++        label: '5h',
++        status: 'ok',
++        percentUsed: 1 / 100,
++        resetsAt: '2026-10-11T01:21:36.000Z',
++        limitReached: false,
++      },
++      {
++        id: 'weekly',
++        label: 'Weekly',
++        status: 'ok',
++        percentUsed: 19 / 100,
++        resetsAt: '2026-10-12T00:00:00.000Z',
++        limitReached: false,
++      },
++      {
++        id: 'monthly',
++        label: 'Monthly',
++        status: 'ok',
++        percentUsed: 30 / 100,
++        resetsAt: '2026-10-23T21:44:23.000Z',
++        limitReached: false,
++      },
++    ])
++    expect(result.binding).toBe('monthly')
++    expect(result.limitReached).toBe(false)
++  })
++
++  it('accepts percent 0 as a valid, unexhausted window', () => {
++    const result = expectOk(parseUsagePayload({ usage: { rolling: window({ percent: 0 }) } }))
++
++    expect(result.windows).toHaveLength(1)
++    expect(result.windows[0]?.percentUsed).toBe(0)
++    expect(result.windows[0]?.limitReached).toBe(false)
++    expect(result.limitReached).toBe(false)
++  })
++
++  it('treats percent 100 as exhausted', () => {
++    const result = expectOk(parseUsagePayload({ usage: { monthly: window({ percent: 100 }) } }))
++
++    expect(result.windows[0]?.percentUsed).toBe(1)
++    expect(result.windows[0]?.limitReached).toBe(true)
++    expect(result.limitReached).toBe(true)
++    expect(result.binding).toBe('monthly')
++  })
++
++  it('drops windows whose percent is out of range', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ percent: 101 }), weekly: window({ percent: -1 }), monthly: window() },
++      }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['monthly'])
++  })
++
++  it('drops windows whose percent is not a finite number', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: {
++          rolling: window({ percent: Number.NaN }),
++          weekly: window({ percent: Number.POSITIVE_INFINITY }),
++          monthly: window(),
++        },
++      }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['monthly'])
++  })
++
++  it('drops a window whose percent is not a number at all', () => {
++    const result = expectOk(
++      parseUsagePayload({ usage: { rolling: window({ percent: '50' }), weekly: window() } }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['weekly'])
++  })
++
++  it('reports a parse failure when every window was dropped', () => {
++    const result = parseUsagePayload({
++      usage: { rolling: window({ percent: 101 }), weekly: window({ status: 'exhausted' }) },
++    })
++
++    expect(result).toEqual({
++      ok: false,
++      reason: 'parse',
++      message: 'response carried no usable usage windows',
++    })
++  })
++
++  it('drops a window with an unknown status', () => {
++    const result = expectOk(
++      parseUsagePayload({ usage: { rolling: window({ status: 'exhausted' }), weekly: window() } }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['weekly'])
++  })
++
++  it('treats rate-limited as fully used regardless of the reported percent', () => {
++    const result = expectOk(
++      parseUsagePayload({ usage: { rolling: window({ status: 'rate-limited', percent: 3 }) } }),
++    )
++
++    expect(result.windows[0]?.percentUsed).toBe(1)
++    expect(result.windows[0]?.limitReached).toBe(true)
++    expect(result.limitReached).toBe(true)
++  })
++
++  it('drops windows with a missing or empty resetsAt', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: {
++          rolling: window({ resetsAt: undefined }),
++          weekly: window({ resetsAt: '' }),
++          monthly: window(),
++        },
++      }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['monthly'])
++  })
++
++  it('drops a whitespace-only resetsAt', () => {
++    const result = expectOk(
++      parseUsagePayload({ usage: { rolling: window({ resetsAt: '   ' }), weekly: window() } }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['weekly'])
++  })
++
++  it('drops resetsAt values that Date.parse cannot read', () => {
++    const result = expectOk(
++      parseUsagePayload({ usage: { rolling: window({ resetsAt: 'soon' }), weekly: window() } }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['weekly'])
++  })
++
++  it('drops a non-string resetsAt', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ resetsAt: 1_700_000_000_000 }), weekly: window() },
++      }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['weekly'])
++  })
++
++  it('parses only the known window keys and ignores unknown ones', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window(), daily: window({ percent: 90 }), extra: 'ignored' },
++        somethingElse: { rolling: window({ percent: 99 }) },
++      }),
++    )
++
++    expect(result.windows.map((entry) => entry.id)).toEqual(['rolling'])
++    expect(result.binding).toBe('rolling')
++  })
++
++  it('ignores unknown extra fields inside a window', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ provider: 'opencode', percentRemaining: 99 }) },
++      }),
++    )
++
++    expect(result.windows[0]).toEqual({
++      id: 'rolling',
++      label: '5h',
++      status: 'ok',
++      percentUsed: 0.5,
++      resetsAt: '2026-10-11T01:21:36.000Z',
++      limitReached: false,
++    })
++  })
++
++  it('fails when the payload carries no usable usage object', () => {
++    const inputs: unknown[] = [
++      null,
++      undefined,
++      0,
++      'usage',
++      [],
++      { usage: null },
++      { usage: [] },
++      { usage: 'nope' },
++      { usage: 7 },
++      {},
++    ]
++
++    for (const input of inputs) {
++      const result = parseUsagePayload(input)
++      expect(result.ok, `expected failure for ${JSON.stringify(input)}`).toBe(false)
++      if (!result.ok) expect(result.reason).toBe('parse')
++    }
++  })
++
++  it('never throws on malformed input', () => {
++    const inputs: unknown[] = [Symbol('x'), () => undefined, new Date(), new Map(), { usage: new Map() }]
++
++    for (const input of inputs) {
++      expect(() => parseUsagePayload(input)).not.toThrow()
++    }
++  })
++
++  it('binds the window with the highest percentUsed', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ percent: 10 }), weekly: window({ percent: 80 }), monthly: window({ percent: 20 }) },
++      }),
++    )
++
++    expect(result.binding).toBe('weekly')
++  })
++
++  it('breaks binding ties toward the shorter window', () => {
++    const rollingWeekly = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ percent: 50 }), weekly: window({ percent: 50 }), monthly: window({ percent: 1 }) },
++      }),
++    )
++    expect(rollingWeekly.binding).toBe('rolling')
++
++    const weeklyMonthly = expectOk(
++      parseUsagePayload({
++        usage: { weekly: window({ percent: 50 }), monthly: window({ percent: 50 }) },
++      }),
++    )
++    expect(weeklyMonthly.binding).toBe('weekly')
++  })
++
++  it('treats a rate-limited window as binding even with a lower percent', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: {
++          rolling: window({ status: 'rate-limited', percent: 0 }),
++          monthly: window({ percent: 99 }),
++        },
++      }),
++    )
++
++    expect(result.binding).toBe('rolling')
++    expect(result.limitReached).toBe(true)
++  })
++
++  it('reports overall limitReached when any single window is exhausted', () => {
++    const result = expectOk(
++      parseUsagePayload({
++        usage: { rolling: window({ percent: 1 }), weekly: window({ percent: 100 }), monthly: window({ percent: 2 }) },
++      }),
++    )
++
++    expect(result.limitReached).toBe(true)
++    expect(result.binding).toBe('weekly')
++  })
++})
+--- /dev/null
++++ src/cache.test.ts
+@@ -0,0 +1,332 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++import { createSnapshotCache, DEFAULT_MIN_REFRESH_MS, type CachedEnvelope, type SnapshotCache } from './cache.js'
++import type { UsageEnvelope } from './wire-types.js'
++
++/** A good reading; the fixture timestamp is overridable so staleness is visible. */
++function ok(fetchedAt = '2026-10-10T00:00:00.000Z', percent = 50): CachedEnvelope {
++  return {
++    ok: true,
++    snapshot: {
++      label: 'OpenCode Go',
++      fetchedAt,
++      stale: false,
++      limitReached: false,
++      binding: 'monthly',
++      windows: [
++        {
++          id: 'monthly',
++          label: 'Monthly',
++          status: 'ok',
++          percentUsed: percent / 100,
++          resetsAt: '2026-10-23T21:44:23.000Z',
++          limitReached: false,
++        },
++      ],
++    },
++  }
++}
++
++/** A loader that counts how many times it ran. */
++function counting(envelope: UsageEnvelope | (() => Promise<UsageEnvelope>)) {
++  let calls = 0
++  const load = async (): Promise<UsageEnvelope> => {
++    calls += 1
++    return typeof envelope === 'function' ? envelope() : envelope
++  }
++  return { calls: () => calls, load }
++}
++
++/** A promise plus its resolver, for in-flight tests. */
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  const promise = new Promise<T>((res) => {
++    resolve = res
++  })
++  return { promise, resolve }
++}
++
++describe('createSnapshotCache', () => {
++  let clock: number
++  let now: () => number
++
++  beforeEach(() => {
++    clock = 0
++    now = () => clock
++  })
++
++  function makeCache(options: { ttlMs?: number; minRefreshMs?: number } = {}): SnapshotCache {
++    return createSnapshotCache({ ttlMs: options.ttlMs ?? 1000, minRefreshMs: options.minRefreshMs, now })
++  }
++
++  it('serves a fresh cached reading without invoking the loader', async () => {
++    const cache = makeCache()
++    const cachedReading = ok('2026-10-10T00:00:00.000Z', 10)
++    cache.set(cachedReading)
++    const loader = counting(ok('2026-10-10T01:00:00.000Z', 90))
++
++    const result = await cache.load(loader.load)
++
++    expect(result).toBe(cachedReading)
++    expect(loader.calls()).toBe(0)
++    expect(cache.get()).toBe(cachedReading)
++  })
++
++  it('is fresh strictly within the TTL window', () => {
++    const cache = makeCache({ ttlMs: 1000 })
++    cache.set(ok())
++
++    clock = 999
++    expect(cache.isFresh()).toBe(true)
++    expect(cache.ageMs()).toBe(999)
++
++    clock = 1000
++    expect(cache.isFresh()).toBe(false)
++  })
++
++  it('reports no freshness or age before anything is cached', () => {
++    const cache = makeCache()
++
++    expect(cache.isFresh()).toBe(false)
++    expect(cache.get()).toBeUndefined()
++    expect(cache.ageMs()).toBeUndefined()
++  })
++
++  it('invokes the loader once for an expired reading and stores the new one', async () => {
++    const cache = makeCache({ ttlMs: 1000 })
++    cache.set(ok('2026-10-10T00:00:00.000Z', 10))
++    const fresh = ok('2026-10-10T02:00:00.000Z', 20)
++    const loader = counting(fresh)
++
++    clock = 1000
++    const result = await cache.load(loader.load)
++
++    expect(loader.calls()).toBe(1)
++    expect(result).toBe(fresh)
++    expect(cache.get()).toBe(fresh)
++    expect(cache.isFresh()).toBe(true)
++  })
++
++  it('restarts the TTL window on every set', () => {
++    const cache = makeCache({ ttlMs: 1000 })
++    cache.set(ok())
++    clock = 900
++    cache.set(ok('2026-10-10T00:01:00.000Z'))
++
++    clock = 1500
++    expect(cache.ageMs()).toBe(600)
++    expect(cache.isFresh()).toBe(true)
++  })
++
++  it('shares one in-flight loader invocation between concurrent callers', async () => {
++    const cache = makeCache()
++    const gate = deferred<UsageEnvelope>()
++    const loader = counting(() => gate.promise)
++
++    const first = cache.load(loader.load)
++    const second = cache.load(loader.load)
++
++    expect(loader.calls()).toBe(1)
++    expect(second).toBe(first)
++
++    const reading = ok()
++    gate.resolve(reading)
++
++    await expect(first).resolves.toBe(reading)
++    await expect(second).resolves.toBe(reading)
++    expect(loader.calls()).toBe(1)
++  })
++
++  it('allows a new load after the in-flight one settled', async () => {
++    const cache = makeCache()
++    const loader = counting(ok())
++
++    await cache.load(loader.load)
++    clock = 1000
++    await cache.load(loader.load)
++
++    expect(loader.calls()).toBe(2)
++  })
++
++  it('marks a reading stale when a reload fails on the network', async () => {
++    const cache = makeCache()
++    const good = ok('2026-10-10T00:00:00.000Z', 40)
++    cache.set(good)
++    clock = 10_000
++    const failure: UsageEnvelope = { ok: false, reason: 'network', message: 'provider request failed (network or timeout)' }
++
++    const result = await cache.load(async () => failure)
++
++    expect(result).toEqual({ ok: true, snapshot: { ...good.snapshot, stale: true } })
++    if (!result.ok) throw new Error('expected the stale reading to be served')
++    expect(result.snapshot.fetchedAt).toBe(good.snapshot.fetchedAt)
++    expect(cache.get()?.snapshot.stale).toBe(true)
++    // The failed reload must not have refreshed the TTL window.
++    expect(cache.isFresh()).toBe(false)
++  })
++
++  it('marks a reading stale when a reload cannot be parsed', async () => {
++    const cache = makeCache()
++    cache.set(ok())
++    clock = 10_000
++
++    const result = await cache.load(async () => ({ ok: false, reason: 'parse', message: 'response carried no usable usage windows' }))
++
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('expected the stale reading to be served')
++    expect(result.snapshot.stale).toBe(true)
++  })
++
++  it('propagates a transport failure when there is no previous reading', async () => {
++    const cache = makeCache()
++    const failure: UsageEnvelope = { ok: false, reason: 'network', message: 'provider request failed (network or timeout)' }
++
++    const result = await cache.load(async () => failure)
++
++    expect(result).toBe(failure)
++    expect(cache.get()).toBeUndefined()
++  })
++
++  it('converts a throwing loader into a transport failure without leaking its message', async () => {
++    const cache = makeCache()
++
++    const result = await cache.load(async () => {
++      throw new Error('Bearer sk-super-secret-value')
++    })
++
++    expect(result).toEqual({ ok: false, reason: 'network', message: 'quota load failed' })
++    expect(JSON.stringify(result)).not.toContain('sk-super-secret-value')
++  })
++
++  it('clears the cache and propagates a missing credential', async () => {
++    const cache = makeCache()
++    cache.set(ok())
++    clock = 10_000
++    const failure: UsageEnvelope = { ok: false, reason: 'key-missing', message: 'credential OPENCODE_GO_API_KEY is not set' }
++
++    const result = await cache.load(async () => failure)
++
++    expect(result).toBe(failure)
++    expect(cache.get()).toBeUndefined()
++    expect(cache.ageMs()).toBeUndefined()
++    expect(cache.isFresh()).toBe(false)
++  })
++
++  it('clears the cache and propagates an invalid credential', async () => {
++    const cache = makeCache()
++    cache.set(ok())
++    clock = 10_000
++    const failure: UsageEnvelope = { ok: false, reason: 'key-invalid', status: 401, message: 'provider rejected the credential (401)' }
++
++    const result = await cache.load(async () => failure)
++
++    expect(result).toBe(failure)
++    expect(cache.get()).toBeUndefined()
++  })
++
++  it('keeps the last good reading through a not-found or http failure but does not serve it as stale', async () => {
++    const cache = makeCache()
++    const good = ok()
++    cache.set(good)
++    clock = 10_000
++    const notFound: UsageEnvelope = { ok: false, reason: 'not-found', status: 404, message: 'usage endpoint not found (404)' }
++
++    const first = await cache.load(async () => notFound)
++    expect(first).toBe(notFound)
++    expect(cache.get()).toBe(good)
++
++    const httpFailure: UsageEnvelope = { ok: false, reason: 'http', status: 500, message: 'provider returned HTTP 500' }
++    const second = await cache.load(async () => httpFailure)
++    expect(second).toBe(httpFailure)
++    expect(cache.get()).toBe(good)
++  })
++
++  it('stores a successful load with stale false', async () => {
++    const cache = makeCache()
++    const reading = ok()
++
++    const result = await cache.load(async () => reading)
++
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('expected a successful load')
++    expect(result.snapshot.stale).toBe(false)
++    expect(cache.get()?.snapshot.stale).toBe(false)
++    expect(cache.isFresh()).toBe(true)
++  })
++
++  it('gates forced refreshes behind the default floor', async () => {
++    const cache = makeCache()
++    const loader = counting(ok())
++
++    expect(cache.canForceRefresh()).toBe(true)
++    await cache.load(loader.load)
++    expect(cache.canForceRefresh()).toBe(false)
++
++    clock = DEFAULT_MIN_REFRESH_MS - 1
++    expect(cache.canForceRefresh()).toBe(false)
++
++    clock = DEFAULT_MIN_REFRESH_MS
++    expect(cache.canForceRefresh()).toBe(true)
++  })
++
++  it('honours a custom refresh floor', async () => {
++    const cache = makeCache({ minRefreshMs: 250 })
++    const loader = counting(ok())
++
++    await cache.load(loader.load)
++    clock = 249
++    expect(cache.canForceRefresh()).toBe(false)
++    clock = 250
++    expect(cache.canForceRefresh()).toBe(true)
++  })
++
++  it('does not start the refresh floor for a manually set reading', () => {
++    const cache = makeCache()
++    cache.set(ok())
++
++    expect(cache.canForceRefresh()).toBe(true)
++  })
++
++  it('bypasses the TTL for a forced load', async () => {
++    const cache = makeCache()
++    const cachedReading = ok('2026-10-10T00:00:00.000Z', 10)
++    cache.set(cachedReading)
++    const replacement = ok('2026-10-10T03:00:00.000Z', 90)
++    const loader = counting(replacement)
++
++    const unforced = await cache.load(loader.load)
++    expect(unforced).toBe(cachedReading)
++    expect(loader.calls()).toBe(0)
++
++    const forced = await cache.load(loader.load, { force: true })
++    expect(forced).toBe(replacement)
++    expect(loader.calls()).toBe(1)
++    expect(cache.get()).toBe(replacement)
++  })
++
++  it('does not start a second provider call while a forced refresh is in flight', async () => {
++    const cache = makeCache()
++    cache.set(ok())
++    const gate = deferred<UsageEnvelope>()
++    const loader = counting(() => gate.promise)
++
++    const first = cache.load(loader.load, { force: true })
++    const second = cache.load(loader.load, { force: true })
++
++    expect(loader.calls()).toBe(1)
++    expect(second).toBe(first)
++    gate.resolve(ok('2026-10-10T04:00:00.000Z'))
++    await first
++  })
++
++  it('clears the stored reading', async () => {
++    const cache = makeCache()
++    cache.set(ok())
++    expect(cache.get()).toBeDefined()
++
++    cache.clear()
++
++    expect(cache.get()).toBeUndefined()
++    expect(cache.ageMs()).toBeUndefined()
++    expect(cache.isFresh()).toBe(false)
++  })
++})
+--- /dev/null
++++ src/route.test.ts
+@@ -0,0 +1,549 @@
++import type { IncomingMessage, ServerResponse } from 'node:http'
++import { describe, expect, it } from 'vitest'
++import type { PeerAdmission, PeerScope } from '@deepseek-ai/dsh-client-connection'
++import packageJson from '../package.json' with { type: 'json' }
++import { createSnapshotCache, type CachedEnvelope } from './cache.js'
++import { fetchQuota, USER_AGENT } from './quota-provider.js'
++import { createUsageHandler, REFRESH_ROUTE, USAGE_ROUTE, type UsageHandlerDeps } from './route.js'
++import type { UsageEnvelope } from './wire-types.js'
++
++/** A valid provider body (the verified live shape). */
++const QUOTA_BODY = {
++  usage: {
++    rolling: { status: 'ok', percent: 1, resetsAt: '2026-10-11T01:21:36.000Z' },
++    weekly: { status: 'ok', percent: 19, resetsAt: '2026-10-12T00:00:00.000Z' },
++    monthly: { status: 'ok', percent: 30, resetsAt: '2026-10-23T21:44:23.000Z' },
++  },
++}
++
++const ENDPOINT = 'https://opencode.test/zen/go/v1/usage'
++
++/** A successful envelope for cache seeding and route expectations. */
++function okEnvelope(fetchedAt = '2026-10-10T00:00:00.000Z', tag = 'seeded'): CachedEnvelope {
++  return {
++    ok: true,
++    snapshot: {
++      label: tag,
++      fetchedAt,
++      stale: false,
++      limitReached: false,
++      binding: 'monthly',
++      windows: [
++        {
++          id: 'monthly',
++          label: 'Monthly',
++          status: 'ok',
++          percentUsed: 0.3,
++          resetsAt: '2026-10-23T21:44:23.000Z',
++          limitReached: false,
++        },
++      ],
++    },
++  }
++}
++
++/** A counting provider loader for handler tests. */
++function spyLoader(produce: () => UsageEnvelope | Promise<UsageEnvelope>) {
++  let calls = 0
++  return {
++    calls: () => calls,
++    loadEnvelope: async (): Promise<UsageEnvelope> => {
++      calls += 1
++      return produce()
++    },
++  }
++}
++
++/** The admitted arm of an admission; the handler only tests that it is not a refusal. */
++const ADMITTED: PeerAdmission = { peer: {} as PeerScope }
++
++/** A minimal node request stand-in; only method, url, and headers are read. */
++function fakeRequest(method: string, url: string): IncomingMessage {
++  return { method, url, headers: {} } as unknown as IncomingMessage
++}
++
++/** A response stand-in that captures status, headers, and body. */
++function fakeResponse(): { res: ServerResponse; captured: { status: number; headers: Record<string, string>; body: string } } {
++  const captured = { status: 0, headers: {} as Record<string, string>, body: '' }
++  const res = {
++    get headersSent(): boolean {
++      return captured.status !== 0
++    },
++    writeHead(status: number, headers?: Record<string, string | number>): unknown {
++      captured.status = status
++      for (const [key, value] of Object.entries(headers ?? {})) captured.headers[key] = String(value)
++      return res
++    },
++    end(body?: string): void {
++      captured.body = body ?? ''
++    },
++  }
++  return { res: res as unknown as ServerResponse, captured }
++}
++
++/** Drive the handler once and capture its response. */
++async function call(
++  deps: UsageHandlerDeps,
++  method: string,
++  url: string,
++): Promise<{ status: number; headers: Record<string, string>; body: string; json: unknown }> {
++  const { res, captured } = fakeResponse()
++  await createUsageHandler(deps)(fakeRequest(method, url), res)
++  return {
++    status: captured.status,
++    headers: captured.headers,
++    body: captured.body,
++    json: captured.body === '' ? undefined : JSON.parse(captured.body),
++  }
++}
++
++describe('fetchQuota', () => {
++  it('sends a Bearer request with the documented headers and a deadline signal', async () => {
++    const seen: Array<{ url: string; init: RequestInit }> = []
++    const fetchImpl: typeof fetch = async (url, init) => {
++      seen.push({ url: String(url), init: init ?? {} })
++      return new Response(JSON.stringify(QUOTA_BODY), { status: 200 })
++    }
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++      now: () => Date.UTC(2026, 9, 10, 12, 0, 0),
++    })
++
++    expect(seen).toHaveLength(1)
++    expect(seen[0]?.url).toBe(ENDPOINT)
++    expect(seen[0]?.init.method).toBe('GET')
++    const headers = seen[0]?.init.headers as Record<string, string>
++    expect(headers.Authorization).toBe('Bearer sk-test-key')
++    expect(headers.Accept).toBe('application/json')
++    expect(headers['User-Agent']).toBe(`dsh-opencode-go-usage/${packageJson.version}`)
++    expect(USER_AGENT).toBe(`dsh-opencode-go-usage/${packageJson.version}`)
++    expect(seen[0]?.init.signal).toBeInstanceOf(AbortSignal)
++
++    expect(envelope).toEqual({
++      ok: true,
++      snapshot: {
++        label: 'OpenCode Go',
++        fetchedAt: '2026-10-10T12:00:00.000Z',
++        stale: false,
++        limitReached: false,
++        binding: 'monthly',
++        windows: [
++          {
++            id: 'rolling',
++            label: '5h',
++            status: 'ok',
++            percentUsed: 0.01,
++            resetsAt: '2026-10-11T01:21:36.000Z',
++            limitReached: false,
++          },
++          {
++            id: 'weekly',
++            label: 'Weekly',
++            status: 'ok',
++            percentUsed: 0.19,
++            resetsAt: '2026-10-12T00:00:00.000Z',
++            limitReached: false,
++          },
++          {
++            id: 'monthly',
++            label: 'Monthly',
++            status: 'ok',
++            percentUsed: 0.3,
++            resetsAt: '2026-10-23T21:44:23.000Z',
++            limitReached: false,
++          },
++        ],
++      },
++    })
++  })
++
++  it('maps 401 and 403 to key-invalid', async () => {
++    for (const status of [401, 403]) {
++      const fetchImpl: typeof fetch = async () => new Response('denied', { status })
++      const envelope = await fetchQuota({
++        url: ENDPOINT,
++        apiKey: 'sk-test-key',
++        timeoutMs: 50,
++        label: 'OpenCode Go',
++        fetchImpl,
++      })
++
++      expect(envelope).toEqual({
++        ok: false,
++        reason: 'key-invalid',
++        status,
++        message: `provider rejected the credential (${status})`,
++      })
++    }
++  })
++
++  it('maps 404 to not-found naming the usageUrl field', async () => {
++    const fetchImpl: typeof fetch = async () => new Response('gone', { status: 404 })
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++    })
++
++    expect(envelope).toEqual({
++      ok: false,
++      reason: 'not-found',
++      status: 404,
++      message: 'usage endpoint not found (404); check the configured usageUrl',
++    })
++  })
++
++  it('maps any other non-2xx status to http with the status code', async () => {
++    const fetchImpl: typeof fetch = async () => new Response('boom', { status: 500 })
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++    })
++
++    expect(envelope).toEqual({
++      ok: false,
++      reason: 'http',
++      status: 500,
++      message: 'provider returned HTTP 500',
++    })
++  })
++
++  it('maps an unparseable JSON body to parse', async () => {
++    const fetchImpl: typeof fetch = async () => new Response('<html>not json</html>', { status: 200 })
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++    })
++
++    expect(envelope).toEqual({ ok: false, reason: 'parse', message: 'provider returned a non-JSON body' })
++  })
++
++  it('maps a JSON body without usable windows to parse', async () => {
++    const fetchImpl: typeof fetch = async () => new Response(JSON.stringify({ usage: { rolling: { status: 'paused' } } }), { status: 200 })
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++    })
++
++    expect(envelope).toEqual({
++      ok: false,
++      reason: 'parse',
++      message: 'response carried no usable usage windows',
++    })
++  })
++
++  it('maps a transport rejection and an abort to network', async () => {
++    const rejects: typeof fetch = async () => {
++      throw new Error(`connect ECONNREFUSED for ${ENDPOINT}`)
++    }
++    const aborts: typeof fetch = async () => {
++      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
++    }
++
++    for (const fetchImpl of [rejects, aborts]) {
++      const envelope = await fetchQuota({
++        url: ENDPOINT,
++        apiKey: 'sk-test-key',
++        timeoutMs: 50,
++        label: 'OpenCode Go',
++        fetchImpl,
++      })
++
++      expect(envelope).toEqual({
++        ok: false,
++        reason: 'network',
++        message: 'provider request failed (network or timeout)',
++      })
++    }
++  })
++
++  it('carries rate-limited and limitReached through to the snapshot', async () => {
++    const fetchImpl: typeof fetch = async () =>
++      new Response(
++        JSON.stringify({
++          usage: {
++            rolling: { status: 'rate-limited', percent: 2, resetsAt: '2026-10-11T01:21:36.000Z' },
++            monthly: { status: 'ok', percent: 100, resetsAt: '2026-10-23T21:44:23.000Z' },
++          },
++        }),
++        { status: 200 },
++      )
++
++    const envelope = await fetchQuota({
++      url: ENDPOINT,
++      apiKey: 'sk-test-key',
++      timeoutMs: 50,
++      label: 'OpenCode Go',
++      fetchImpl,
++    })
++
++    expect(envelope.ok).toBe(true)
++    if (!envelope.ok) throw new Error('expected a successful read')
++    expect(envelope.snapshot.limitReached).toBe(true)
++    expect(envelope.snapshot.binding).toBe('rolling')
++    expect(envelope.snapshot.windows.map((entry) => entry.percentUsed)).toEqual([1, 1])
++  })
++})
++
++describe('createUsageHandler', () => {
++  function baseDeps(overrides: Partial<UsageHandlerDeps> = {}): UsageHandlerDeps {
++    return {
++      cache: createSnapshotCache({ ttlMs: 60_000, now: () => 0 }),
++      loadEnvelope: spyLoader(() => okEnvelope()).loadEnvelope,
++      admit: () => ADMITTED,
++      ...overrides,
++    }
++  }
++
++  it('passes a 401 refusal through without touching the cache or the provider', async () => {
++    const loader = spyLoader(() => okEnvelope())
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++
++    const response = await call(
++      { cache, loadEnvelope: loader.loadEnvelope, admit: () => ({ rejection: 401 }) },
++      'GET',
++      USAGE_ROUTE,
++    )
++
++    expect(response.status).toBe(401)
++    expect(response.json).toEqual({ ok: false, reason: 'http', status: 401 })
++    expect(loader.calls()).toBe(0)
++    expect(cache.get()).toBeUndefined()
++  })
++
++  it('passes a 403 refusal through on the refresh route as well', async () => {
++    const loader = spyLoader(() => okEnvelope())
++
++    const response = await call(
++      {
++        cache: createSnapshotCache({ ttlMs: 60_000, now: () => 0 }),
++        loadEnvelope: loader.loadEnvelope,
++        admit: () => ({ rejection: 403 }),
++      },
++      'POST',
++      REFRESH_ROUTE,
++    )
++
++    expect(response.status).toBe(403)
++    expect(response.json).toEqual({ ok: false, reason: 'http', status: 403 })
++    expect(loader.calls()).toBe(0)
++  })
++
++  it('serves a fresh cached reading on GET without loading', async () => {
++    const loader = spyLoader(() => okEnvelope('2026-10-10T09:00:00.000Z', 'loaded'))
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++    const seeded = okEnvelope('2026-10-10T00:00:00.000Z', 'seeded')
++    cache.set(seeded)
++
++    const response = await call({ cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }, 'GET', USAGE_ROUTE)
++
++    expect(response.status).toBe(200)
++    expect(response.json).toEqual(seeded)
++    expect(loader.calls()).toBe(0)
++  })
++
++  it('loads once on a GET miss and then serves the loaded reading from cache', async () => {
++    let clock = 0
++    const loader = spyLoader(() => okEnvelope('2026-10-10T00:00:01.000Z', 'loaded'))
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => clock })
++    const deps: UsageHandlerDeps = { cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }
++
++    const first = await call(deps, 'GET', USAGE_ROUTE)
++    expect(first.status).toBe(200)
++    expect(first.json).toMatchObject({ ok: true, snapshot: { label: 'loaded' } })
++    expect(loader.calls()).toBe(1)
++
++    clock = 1000
++    const second = await call(deps, 'GET', USAGE_ROUTE)
++    expect(second.json).toEqual(first.json)
++    expect(loader.calls()).toBe(1)
++  })
++
++  it('reloads on GET once the cached reading expired', async () => {
++    let clock = 0
++    const loader = spyLoader(() => okEnvelope('2026-10-10T00:00:05.000Z', 'reloaded'))
++    const cache = createSnapshotCache({ ttlMs: 1000, now: () => clock })
++    cache.set(okEnvelope('2026-10-10T00:00:00.000Z', 'old'))
++    const deps: UsageHandlerDeps = { cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }
++
++    clock = 1001
++    const response = await call(deps, 'GET', USAGE_ROUTE)
++
++    expect(loader.calls()).toBe(1)
++    expect(response.json).toMatchObject({ ok: true, snapshot: { label: 'reloaded' } })
++  })
++
++  it('serves the current reading on a refresh inside the floor without calling the provider', async () => {
++    let clock = 0
++    const first = okEnvelope('2026-10-10T00:00:00.000Z', 'first')
++    let produced: UsageEnvelope = first
++    const loader = spyLoader(() => produced)
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => clock })
++    // A real load starts the refresh floor.
++    await cache.load(loader.loadEnvelope)
++    expect(loader.calls()).toBe(1)
++    produced = okEnvelope('2026-10-10T00:10:00.000Z', 'second')
++
++    clock = 1000
++    const response = await call({ cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }, 'POST', REFRESH_ROUTE)
++
++    expect(response.status).toBe(200)
++    expect(response.json).toEqual(first)
++    expect(loader.calls()).toBe(1)
++  })
++
++  it('forces a reload on a refresh after the floor elapses', async () => {
++    let clock = 0
++    let produced: UsageEnvelope = okEnvelope('2026-10-10T00:00:00.000Z', 'first')
++    const loader = spyLoader(() => produced)
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => clock })
++    await cache.load(loader.loadEnvelope)
++    produced = okEnvelope('2026-10-10T00:10:00.000Z', 'second')
++
++    clock = 5000
++    const response = await call({ cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }, 'POST', REFRESH_ROUTE)
++
++    expect(loader.calls()).toBe(2)
++    expect(response.json).toMatchObject({ ok: true, snapshot: { label: 'second' } })
++  })
++
++  it('reports a throttled refresh when no reading is available yet', async () => {
++    let clock = 0
++    const loader = spyLoader(() => okEnvelope())
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => clock })
++    // A failed first load starts the floor but stores nothing.
++    await cache.load(async () => ({ ok: false, reason: 'network', message: 'provider request failed (network or timeout)' }))
++
++    clock = 1000
++    const response = await call({ cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }, 'POST', REFRESH_ROUTE)
++
++    expect(response.status).toBe(200)
++    expect(response.json).toEqual({ ok: false, reason: 'http', message: 'refresh is throttled; no reading is available yet' })
++    expect(loader.calls()).toBe(0)
++  })
++
++  it('answers 405 with an Allow header and never calls the provider', async () => {
++    const loader = spyLoader(() => okEnvelope())
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++    const deps: UsageHandlerDeps = { cache, loadEnvelope: loader.loadEnvelope, admit: () => ADMITTED }
++
++    const postUsage = await call(deps, 'POST', USAGE_ROUTE)
++    expect(postUsage.status).toBe(405)
++    expect(postUsage.headers.Allow).toBe('GET')
++    expect(postUsage.json).toEqual({ ok: false, reason: 'http', status: 405, message: 'method not allowed' })
++
++    const getRefresh = await call(deps, 'GET', REFRESH_ROUTE)
++    expect(getRefresh.status).toBe(405)
++    expect(getRefresh.headers.Allow).toBe('POST')
++
++    const deleteUsage = await call(deps, 'DELETE', USAGE_ROUTE)
++    expect(deleteUsage.status).toBe(405)
++    expect(deleteUsage.headers.Allow).toBe('GET')
++
++    expect(loader.calls()).toBe(0)
++  })
++
++  it('answers 404 on an unknown path', async () => {
++    const response = await call(baseDeps(), 'GET', '/__dsh_opencode_go_usage__/nope')
++
++    expect(response.status).toBe(404)
++    expect(response.json).toEqual({ ok: false, reason: 'http', status: 404, message: 'unknown route' })
++  })
++
++  it('writes JSON with an explicit Content-Length and no-store', async () => {
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++    cache.set(okEnvelope())
++
++    const response = await call(baseDeps({ cache }), 'GET', USAGE_ROUTE)
++
++    expect(response.headers['Content-Type']).toBe('application/json; charset=utf-8')
++    expect(response.headers['Content-Length']).toBe(String(Buffer.byteLength(response.body, 'utf8')))
++    expect(Number(response.headers['Content-Length'])).toBe(Buffer.byteLength(response.body, 'utf8'))
++    expect(response.headers['Cache-Control']).toBe('no-store')
++  })
++
++  it('reports the served snapshot age from the injected clock', async () => {
++    const fetchedAt = '2026-10-10T00:00:00.000Z'
++    const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++    cache.set(okEnvelope(fetchedAt))
++
++    const response = await call(
++      baseDeps({ cache, now: () => Date.parse(fetchedAt) + 250 }),
++      'GET',
++      USAGE_ROUTE,
++    )
++
++    expect(response.headers['X-Usage-Snapshot-Age-Ms']).toBe('250')
++  })
++
++  it('never lets the credential or the raw upstream body appear in any response', async () => {
++    const FAKE_KEY = 'sk-opencode-go-SUPERSECRET-abcdef0123456789'
++    const RAW_MARKER = 'RAW-UPSTREAM-BODY-MARKER'
++    const bodies: string[] = []
++    const authorizations: string[] = []
++
++    const scenarios: Array<{ status: number; body: string }> = [
++      // A 200 whose shape drifted: the parser message must stay generic.
++      { status: 200, body: JSON.stringify({ usage: { rolling: { status: 'ok' } }, echo: RAW_MARKER, key: FAKE_KEY }) },
++      // Refusals whose bodies deliberately echo the credential.
++      { status: 401, body: JSON.stringify({ error: RAW_MARKER, key: FAKE_KEY }) },
++      { status: 500, body: JSON.stringify({ error: RAW_MARKER, key: FAKE_KEY }) },
++    ]
++
++    for (const scenario of scenarios) {
++      const fetchImpl: typeof fetch = async (_url, init) => {
++        const headers = new Headers(init?.headers)
++        authorizations.push(headers.get('authorization') ?? '')
++        return new Response(scenario.body, { status: scenario.status })
++      }
++      const loadEnvelope = (): Promise<UsageEnvelope> =>
++        fetchQuota({ url: ENDPOINT, apiKey: FAKE_KEY, timeoutMs: 50, label: 'OpenCode Go', fetchImpl })
++
++      const response = await call(
++        {
++          cache: createSnapshotCache({ ttlMs: 60_000, now: () => 0 }),
++          loadEnvelope,
++          admit: () => ADMITTED,
++        },
++        'GET',
++        USAGE_ROUTE,
++      )
++      bodies.push(response.body)
++    }
++
++    // Also scan the responses that never reach the provider.
++    bodies.push((await call({ ...baseDeps(), admit: () => ({ rejection: 401 }) }, 'GET', USAGE_ROUTE)).body)
++    bodies.push((await call(baseDeps(), 'POST', USAGE_ROUTE)).body)
++    bodies.push((await call(baseDeps(), 'GET', '/__dsh_opencode_go_usage__/nope')).body)
++
++    // The key really was exercised over the wire.
++    expect(authorizations).toEqual([`Bearer ${FAKE_KEY}`, `Bearer ${FAKE_KEY}`, `Bearer ${FAKE_KEY}`])
++
++    for (const body of bodies) {
++      expect(body).not.toContain(FAKE_KEY)
++      expect(body).not.toContain(RAW_MARKER)
++      expect(body).not.toContain('Bearer')
++      expect(body).not.toContain('SUPERSECRET')
++    }
++  })
++})
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,5 +1,13 @@
+ import type { Context } from '@deepseek-ai/cordis'
++import { credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
++// Type-only: also what declares `ctx.webServer` on the Cordis `Context`, and it
++// pins the registered object to the installed `WebRoute` contract.
++import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+ import Schema from '@deepseek-ai/schemastery'
++import { createSnapshotCache } from './cache.js'
++import { fetchQuota } from './quota-provider.js'
++import { createUsageHandler, REFRESH_ROUTE, USAGE_ROUTE } from './route.js'
++import type { UsageEnvelope } from './wire-types.js'
+ 
+ /**
+  * Host half of `dsh-opencode-go-usage`.
+@@ -59,19 +67,91 @@
+ })
+ 
+ /**
++ * The Loader config as it arrives in `apply`, before defaults are applied. Only
++ * used to type the schema call; the schema fills every field.
++ */
++interface RawPluginConfig {
++  apiKeyEnv?: string
++  usageUrl?: string
++  displayName?: string
++  refreshSeconds?: number
++  timeoutMs?: number
++}
++
++/**
+  * Cordis entry point.
+  *
+- * Task 1 stub: it intentionally registers nothing yet. Task 2 adds the
+- * `GET /__dsh_opencode_go_usage__/usage` route (never under the `/api`
+- * namespace, which the connection bridge owns) plus the credentialed fetch and
+- * the TTL cache.
++ * Wires the pure host half to the runtime: one TTL cache, one provider loader
++ * that resolves the credential per call (so a rotated key applies without a
++ * restart), and the two exact routes registered on the host web server. Both
++ * registrations are owned by one `ctx.effect`, so plugin unload removes them.
+  *
+  * @param ctx - the plugin context (injects `webServer`, `credentials`, `connection`).
+  * @param rawConfig - the Loader config for this entry, validated against {@link Config}.
+  */
+ export async function apply(ctx: Context, rawConfig: unknown): Promise<void> {
+-  // Stub: no route registration yet. Referencing the parameters keeps the
+-  // declared contract explicit without pretending to use them.
+-  void ctx
+-  void rawConfig
++  const config = Config(rawConfig as RawPluginConfig | null | undefined)
++
++  const cache = createSnapshotCache({ ttlMs: config.refreshSeconds * 1000 })
++
++  /**
++   * Resolve the credential and read the provider. Runs on every cache miss; the
++   * value is never captured in module state, so a rotated key is picked up by
++   * the next fetch.
++   */
++  const loadEnvelope = async (): Promise<UsageEnvelope> => {
++    // A name outside the reference grammar has no reference to miss: report it
++    // as unset instead of letting `credentialRef` throw. The value is NOT
++    // echoed — an operator who pasted a key into this field must not see it
++    // reflected back through the route.
++    if (!isCredentialRefName(config.apiKeyEnv)) {
++      return {
++        ok: false,
++        reason: 'key-missing',
++        message: 'the configured apiKeyEnv is not a valid credential reference name',
++      }
++    }
++
++    const hit = await ctx.credentials.resolve(credentialRef(config.apiKeyEnv))
++    if (hit === undefined) {
++      // Names the reference, never a value.
++      return {
++        ok: false,
++        reason: 'key-missing',
++        message: `credential ${config.apiKeyEnv} is not set`,
++      }
++    }
++
++    return fetchQuota({
++      url: config.usageUrl,
++      apiKey: hit.value,
++      timeoutMs: config.timeoutMs,
++      label: config.displayName,
++    })
++  }
++
++  const handler = createUsageHandler({
++    cache,
++    loadEnvelope,
++    admit: (req) => ctx.connection.admit(req),
++  })
++
++  ctx.effect(() => {
++    const usageRoute: WebRoute = { kind: 'exact', path: USAGE_ROUTE, handler }
++    const refreshRoute: WebRoute = { kind: 'exact', path: REFRESH_ROUTE, handler }
++    const disposeUsage = ctx.webServer.register(usageRoute)
++    try {
++      const disposeRefresh = ctx.webServer.register(refreshRoute)
++      return () => {
++        // Reverse registration order; both disposers are idempotent.
++        disposeRefresh()
++        disposeUsage()
++      }
++    } catch (error) {
++      // A duplicate-path collision throws from the second register; do not leave
++      // the first route mounted on a failed activation.
++      disposeUsage()
++      throw error
++    }
++  }, 'dsh-opencode-go-usage quota routes')
+ }
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,7 @@
+   "files": [
+     "lib/index.js",
+     "lib/index.d.ts",
++    "lib/index.js.map",
+     "lib/client.js",
+     "lib/client.js.map",
+     "cordis.patch.yml",

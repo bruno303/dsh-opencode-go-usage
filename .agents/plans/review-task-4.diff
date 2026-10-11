@@ -1,0 +1,818 @@
+--- /dev/null
++++ README.md
+@@ -0,0 +1,154 @@
++# dsh-opencode-go-usage
++
++A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) **Web** plugin
++that puts your **OpenCode Go** subscription quota in the sidebar.
++
++It adds one compact indicator to the sidebar foot (beside Settings). Click it for a
++popover with a row per quota window — **rolling / weekly / monthly** — showing the
++percent used and a live countdown to each reset.
++
++```
++OpenCode Go          30%        ← sidebar foot indicator (binding window)
++ ├ rolling   1% used   resets in 13h
++ ├ weekly   19% used   resets in 2d
++ └ monthly  30% used   resets in 13d
++   updated 4m ago
++```
++
++The reading comes from the API key the harness **already uses** for the
++`opencode-go` provider route — there is nothing new to configure if that key is
++already in the DSH credential store.
++
++## What it shows
++
++| Window | Meaning | Typical horizon |
++|---|---|---|
++| `rolling` | shortest moving window (labelled `5h`) | hours |
++| `weekly` | weekly quota | days |
++| `monthly` | monthly quota | weeks |
++
++Each window carries a **percent used** (0–100 %) and a **reset instant**. The
++indicator reports the *binding* window — the one with the highest usage — and
++escalates its colour as that window approaches 100 %.
++
++### There are no dollar amounts
++
++The upstream endpoint returns **percentages only** — `status`, `percent`, and
++`resetsAt` per window. It carries no currency or token totals, and this plugin
++does not estimate them. The verified contract, the evidence behind it, and why
++`/zen/v1/usage` (non-JSON) and `/zen/go/v1/quota` (404) are not used are recorded
++in [docs/opencode-go-usage-api.md](docs/opencode-go-usage-api.md).
++
++## Requirements
++
++| Requirement | Version | Notes |
++|---|---|---|
++| DSH | `>=0.1.7-rc.1 <0.3.0` | Declared in `package.json` → `dsh.engines.dsh`; verified against the installed `0.2.0-rc.2` (`dsh --version`) |
++| Node.js | `>=20` | Declared in `package.json` → `engines.node` |
++| A Web profile | `web` | The plugin's browser half targets `platform: "web"` only |
++| An `opencode-go` credential | — | A reference in the DSH credential store, by default `OPENCODE_GO_API_KEY` |
++
++## Quickstart
++
++```bash
++# 1. Build — lib/ is generated, not committed
++pnpm install
++pnpm run build
++
++# 2. Install into the Web profile (see docs/install.md for the GUI path)
++dsh plugin --profile web add /absolute/path/to/dsh-opencode-go-usage
++
++# 3. Verify
++dsh --profile web --dump-config      # the dsh-opencode-go-usage row is composed
++curl -i http://127.0.0.1:3080/__dsh_opencode_go_usage__/usage   # 401/403 without a session
++```
++
++Then reload the Web GUI: the indicator appears at the sidebar foot.
++
++Full install mechanics, including a manual fallback and uninstall, are in
++[docs/install.md](docs/install.md). Tests and the live checklist are in
++[docs/testing.md](docs/testing.md).
++
++> `pnpm run build` must have been run before installing: DSH resolves the host half
++> from `lib/index.js` and the browser half from `lib/client.js`. Those files are
++> build output and are not part of the source tree.
++
++**Unverified in this document's environment:** the expected output of
++`dsh --profile web --dump-config` and of `dsh plugin --profile web --help`. Both
++commands need write access to `$DSH_HOME` and were denied here; the verbs themselves
++are verified from the launcher's own `dsh --help`. The
++[environment-limits table](docs/install.md#environment-limits-while-writing-this-document)
++in docs/install.md records each attempt and its exact error.
++
++## Configuration
++
++The plugin's exported `Config` schema *is* the DSH settings form for the
++`dsh-opencode-go-usage` entry. **Every field has a working default**, so a fresh
++install needs no configuration at all; add a `config:` block under the plugin row
++only to override something.
++
++| Field | Default | Effect |
++|---|---|---|
++| `apiKeyEnv` | `OPENCODE_GO_API_KEY` | Name of the credential **reference** resolved through the DSH credential seam. This is the name of the secret, never its value — nothing secret is ever stored in configuration. |
++| `usageUrl` | `https://opencode.ai/zen/go/v1/usage` | Quota endpoint. The upstream API is official but undocumented, so the URL stays configurable in case it moves. |
++| `displayName` | `OpenCode Go` | Label shown on the widget and in the popover header. |
++| `refreshSeconds` | `60` | How long a fetched snapshot is served before another provider request is made (the server-side TTL). The browser never calls the provider itself. |
++| `timeoutMs` | `10000` | Deadline for a single provider request, in milliseconds (enforced with an `AbortSignal`). |
++
++Example override in the profile's `cordis.patch.yml`:
++
++```yaml
++- id: dsh-opencode-go-usage
++  name: dsh-opencode-go-usage
++  config:
++    displayName: Go quota
++    refreshSeconds: 300
++```
++
++Credential values are never accepted here. `apiKeyEnv` must be a valid credential
++reference name (a POSIX shell identifier); anything else is reported as
++`key-missing` without being echoed back.
++
++## How it works
++
++```
++browser (sidebar widget)                 host (Cordis plugin)              upstream
++────────────────────────                 ────────────────────              ────────
++GET  /__dsh_opencode_go_usage__/usage ──▶ admit(request)  ── rejection ▶ 401/403
++POST /__dsh_opencode_go_usage__/refresh  │  cache fresh? ── yes ──▶ serve cached snapshot
++                                         │  else resolve credential ref
++                                         │       │
++                                         │       └──▶ GET $usageUrl  ────▶  Authorization: Bearer <key>
++                                         │            parse + validate ◀────  { usage: { rolling, weekly, monthly } }
++                                         └── cache success only
++```
++
++- **The key is resolved host-side, per fetch**, through the DSH credential seam
++  (`ctx.credentials.resolve(credentialRef(apiKeyEnv))`). A rotated key applies to
++  the next fetch with no restart and no configuration edit.
++- **The key never reaches the browser.** Only the quota envelope — label, window
++  percentages, reset instants, timestamps, error *reasons* — crosses into the
++  client. Responses are `no-store`, carry no credential, and never echo the raw
++  upstream body.
++- **Both routes are authenticated.** The handler calls `ctx.connection.admit()`
++  first and passes a refusal status through verbatim; an unauthenticated request
++  never reaches the provider or the cache.
++- **Both routes are exact paths** under `/__dsh_opencode_go_usage__/`, deliberately
++  not under `/api` (which the connection bridge owns). A collision is a loud load
++  failure, not a silent hijack.
++- **Nothing is written outside the process.** There is no local database and no
++  session-log scraping; the cache is in-memory with a single-flight guard so a
++  burst of browser polls produces at most one provider request.
++
++## Documentation
++
++| Document | Contents |
++|---|---|
++| [docs/install.md](docs/install.md) | Installing, key configuration, verification, uninstalling |
++| [docs/testing.md](docs/testing.md) | Unit suites, full gates, build assertions, live checklist, troubleshooting |
++| [docs/opencode-go-usage-api.md](docs/opencode-go-usage-api.md) | Verified upstream API contract, parsing rules, error behaviour, evidence |
++| [PLAN.md](PLAN.md) | Design decisions, architecture facts, risks, and the manual live checklist |
++
++## License
++
++[MIT](LICENSE)
+--- /dev/null
++++ docs/install.md
+@@ -0,0 +1,316 @@
++# Installing `dsh-opencode-go-usage`
++
++This plugin installs into a **DSH profile** — for the Web GUI that is the `web`
++profile, stored under `$DSH_HOME/profiles/web/`. It is an out-of-tree plugin: it
++is added as a profile dependency and selected as a **bundle**.
++
++Two things every install must end with:
++
++1. the package is a dependency of the profile, and
++2. its bundle is **selected** (present in the profile's `dsh.profile.bundles`).
++
++Selecting the bundle is what applies the plugin's own patch (this package's
++[`cordis.patch.yml`](../cordis.patch.yml)), which inserts the host row. The package's
++`dsh.client` manifest is what supplies the browser half (`lib/client.js`) to the
++`web` platform.
++
++> **This document was not executed against a live profile.** It was written from the
++> shipped CLI's own `--help` output, the CLI's argument grammar, and the
++> `dsh-plugin-manager` package README. Details that could not be verified in this
++> environment are marked **unverified** below. Nothing here has been run against a
++> running profile, and no plugin was installed while writing it.
++
++## Before you start
++
++The install uses the **build output**, not the sources:
++
++```bash
++cd /absolute/path/to/dsh-opencode-go-usage
++pnpm install
++pnpm run build
++```
++
++`pnpm run build` emits `lib/index.js`, `lib/index.d.ts`, `lib/client.js` and
++`lib/client.js.map` (plus `lib/index.js.map`). DSH resolves the host half from
++`package.json` → `exports["."]` → `lib/index.js`, and the browser half from
++`dsh.client` → `lib/client.js`. A selected bundle whose `lib/client.js` is missing
++fails activation loudly — see [docs/testing.md](testing.md).
++
++Also confirm the runtime is inside the declared range (see the
++[README](../README.md#requirements)):
++
++```bash
++dsh --version        # verified against 0.2.0-rc.2
++node --version       # >= 20
++```
++
++## Path A (recommended): the Web GUI's Plugins page
++
++The plugin manager performs the whole install — dependency, bundle selection and
++activation — and reports pnpm's output; nothing has to be edited by hand.
++
++1. Open the Web GUI and select **Plugins** in the sidebar.
++2. Click **Add plugin**.
++3. Enter the **absolute local path** to this package, e.g.
++   `/absolute/path/to/dsh-opencode-go-usage`. (The field accepts a package name
++   with an optional version, a Git address, a tarball, or an absolute local path.)
++4. Optionally click **Install guide and examples** first; it explains the accepted
++   spec forms. The trust box notes that installed plugins do not update
++   automatically.
++5. Click **Install**. The Host reads the spec, then starts pnpm; pnpm's command and
++   output are behind **Show install details**, and **Cancel install** is available
++   while it runs.
++6. When it finishes, click **Enable now** on the success screen. Per the
++   plugin-manager README, installation enables a new bundle by default; **Enable
++   now** is the explicit control that makes it certain and scrolls the list to the
++   new card.
++
++The plugin then appears under **Installed**. Its card exposes the settings form
++generated from the plugin's `Config` schema — see
++[Key configuration](#key-configuration).
++
++## Path B (CLI): forwarding to pnpm
++
++The launcher's own help (verified — `dsh --help`) documents this form:
++
++```
++Usage: dsh [--profile] <name> [options] [app-args...]
++       dsh plugin --profile <name> <pnpm-args...>
++...
++  dsh plugin --profile tui add <package>    install a plugin into the tui profile
++```
++
++So the CLI entry point is `dsh plugin`, and **`--profile <name>` is required**
++(verified — running `dsh plugin --help` with no profile exits nonzero with
++`error: required option '--profile <name>' not specified`). Everything after
++`--profile <name>` is forwarded **verbatim to pnpm**, run in the profile
++directory.
++
++Install from the absolute local path:
++
++```bash
++dsh plugin --profile web add /absolute/path/to/dsh-opencode-go-usage
++```
++
++`add <spec>` is the command named in the launcher's own example, and the plugin
++manager reads an absolute local path by parsing that path's `package.json`.
++Selecting the bundle after a successful `add` is the plugin manager's job: the
++plugin-manager README states "Installation enables a new bundle by default."
++Whether `dsh plugin add` selects the bundle exactly as the GUI does is
++**unverified** here — the CLI could not be executed in this environment (see
++[Environment limits](#environment-limits-while-writing-this-document)). Confirm
++selection with the check in [Verification](#verification), and if the bundle is not
++selected, select it on the Plugins page (Path A) or in the profile manifest
++(Manual fallback).
++
++To install a **published or hosted** copy instead of a local path, pass pnpm's own
++spec:
++
++```bash
++dsh plugin --profile web add dsh-opencode-go-usage@0.1.0
++dsh plugin --profile web add github:<owner>/<repo>#v0.1.0
++```
++
++Those spec forms are pnpm's and are accepted by the same forwarding rule. They are
++**not usable today**: this package's v1 scope has no npm publish, so a local path (or
++a Git address once the repository is hosted) is the supported install source —
++`PLAN.md` §8.3 leaves publishing as a later decision.
++
++If pnpm is not on `PATH`, the CLI prints `dsh: pnpm was not found; install pnpm and
++make it available on PATH.` A failed run prints its diagnostics log path. When a
++dependency's install scripts are blocked by pnpm, the failed install lists the
++pending packages and the GUI offers **Allow these scripts and retry**; the CLI
++guidance is the one the CLI prints itself (adding the exact key pnpm named under
++`allowBuilds` in the profile's `pnpm-workspace.yaml`). This package declares no
++`install`/`postinstall`/`prepare` script, so a normal path install should not reach
++that path.
++
++## Manual fallback
++
++If neither path is available, make the two changes yourself. The profile lives at:
++
++| Path | Role |
++|---|---|
++| `$DSH_HOME/profiles/web/package.json` | Profile manifest: `dependencies` **and** `dsh.profile.bundles` |
++| `$DSH_HOME/profiles/web/cordis.patch.yml` | The profile's own patch layer (applied after every bundle layer) |
++
++`$DSH_HOME` defaults to `~/.dsh`.
++
++### 1. Add the dependency and select the bundle
++
++In `$DSH_HOME/profiles/web/package.json`:
++
++```json
++{
++  "dependencies": {
++    "dsh-opencode-go-usage": "file:/absolute/path/to/dsh-opencode-go-usage"
++  },
++  "dsh": {
++    "profile": {
++      "bundles": [
++        "@deepseek-ai/dsh-base",
++        "@deepseek-ai/dsh-web-app",
++        "dsh-opencode-go-usage"
++      ]
++    }
++  }
++}
++```
++
++Then install the dependency the way the profile normally does (the plugin manager's
++own `pnpm add`, with the profile directory as the working directory) so it appears
++in `$DSH_HOME/profiles/web/node_modules/`.
++
++### 2. If — and only if — the bundle is not selectable
++
++Selecting the bundle in `dsh.profile.bundles` makes DSH apply this package's own
++patch. The patch is exactly:
++
++```yaml
++- insert:
++    - id: dsh-opencode-go-usage
++      name: dsh-opencode-go-usage
++```
++
++This is the verbatim content of this package's `cordis.patch.yml`. Pasting it into
++`$DSH_HOME/profiles/web/cordis.patch.yml` is the equivalent explicit insert for a
++setup where the package is loaded as a plain dependency rather than as a selected
++bundle.
++
++> **Warning:** do not do both. If the bundle is selected, DSH already applies the
++> patch above; inserting the same row again in the profile layer duplicates the
++> entry (and its exact routes), and the webserver throws on a duplicate path at
++> load time.
++
++## Key configuration
++
++The plugin never stores a secret. Its `apiKeyEnv` field (default
++`OPENCODE_GO_API_KEY`) names a **credential reference**, and the host resolves the
++value per fetch through the DSH credential seam.
++
++Resolution order, per the `dsh-credentials` README:
++
++1. **The launching environment wins for that run.** `OPENCODE_GO_API_KEY=… dsh web`
++   (or a CI secret, or a container `-e`) is used and reported **read-only**; the
++   store cannot override it.
++2. Otherwise the value comes from the credential store at
++   `$DSH_HOME/.credentials.yaml`, from its top-level `refs` map:
++
++   ```yaml
++   version: 1
++   records:
++     # …durable per-plugin records…
++   refs:
++     DEEPSEEK_API_KEY: <value>
++     OPENCODE_GO_API_KEY: <value>
++   ```
++
++   The `refs` keys are the reference names. An **empty** value counts as absent.
++
++The key is shared with the LLM adapter that already talks to `opencode-go`: the
++profile's `dsh-llm-pi-ai` provider config takes the same reference name. If that
++provider already works, this plugin needs no key work at all.
++
++### Confirm the reference is present without printing the secret
++
++This prints a word, never the value:
++
++```bash
++grep -qE '^[[:space:]]+OPENCODE_GO_API_KEY:' "${DSH_HOME:-$HOME/.dsh}/.credentials.yaml" \
++  && echo "reference is present" \
++  || echo "reference is missing"
++```
++
++Do **not** run a bare `grep OPENCODE_GO_API_KEY …` (or `cat …`) without `-q`/`-c`:
++the matching line contains the secret value. The plugin itself never logs or returns
++it either — a missing reference is reported by *name* (`key-missing`, "credential
++OPENCODE_GO_API_KEY is not set").
++
++To change the reference name, set `apiKeyEnv` to another `refs` key. To use a
++different secret entirely, add it to the store under the name you set.
++
++## Verification
++
++### 1. The plugin row is composed
++
++```bash
++dsh --profile web --dump-config
++```
++
++The composed tree must contain a `dsh-opencode-go-usage` entry. `--dump-config` is
++listed by `dsh --help`; note that it runs the profile's preparation step and
++therefore needs **write access to `$DSH_HOME`** (it rewrites the profile's
++generated `cordis.yml`). It could not be executed while writing this document — see
++[Environment limits](#environment-limits-while-writing-this-document).
++
++### 2. The routes are registered and authenticated
++
++With the GUI running (default `http://127.0.0.1:3080`), an **unauthenticated** call
++must be refused — no unauthenticated reads are possible:
++
++```bash
++curl -i http://127.0.0.1:3080/__dsh_opencode_go_usage__/usage
++```
++
++Expected: `401` or `403` (the status is passed through from the browser-trust
++admission check). A `200` here would mean the fence is down and should be treated
++as a bug.
++
++### 3. The widget is visible
++
++Reload the GUI. The indicator appears at the **sidebar foot**, in both the wide
++sidebar and the collapsed rail. Open it: the popover lists the windows with a reset
++countdown, the fetch age, and a **Refresh** button. A successful reading with three
++windows confirms the host reached the provider with the resolved key.
++
++If it does not appear, start with [docs/testing.md](testing.md#troubleshooting)
++(widget missing ⇒ the bundle is not selected, or `lib/client.js` was never built).
++
++## Uninstalling
++
++1. **Deselect the bundle.** On the Plugins page, switch the bundle off — or, if you
++   are uninstalling entirely, use the page's uninstall action (it asks for
++   confirmation). Deselecting unloads the two routes and the sidebar indicator
++   without touching the package.
++2. **Remove the dependency.** From the GUI this is the same uninstall action; from
++   the CLI:
++
++   ```bash
++   dsh plugin --profile web remove dsh-opencode-go-usage
++   ```
++
++   Per the plugin-manager README, removal removes the bundle from
++   `dsh.profile.bundles`, unloads its runtime contributions, and *then* runs pnpm.
++
++If you installed by hand, reverse the manual steps above: drop any row you pasted
++into `cordis.patch.yml`, drop the bundle name from `dsh.profile.bundles`, then remove
++the dependency.
++
++## While the GUI is running
++
++With HMR enabled in the profile's YAML, the plugin manager serializes configuration
++reloads and a profile change **recomposes the running tree** — installing or
++switching a bundle can hot-reload the GUI and its client module graph mid-session.
++Without HMR, changes apply on restart.
++
++If the result looks wrong, or if the sidebar does not repaint after a switch,
++**restart `dsh web`** and check again before investigating further. The plugin
++manager's own limitations note that package *replacements* (not switches) always
++need a fresh process to load new JavaScript.
++
++## Environment limits while writing this document
++
++Recorded so the reader knows exactly what is verified and what is not:
++
++| Attempt | Result |
++|---|---|
++| `dsh --help` | Verified. Shows `dsh plugin --profile <name> <pnpm-args...>` and the `dsh plugin --profile tui add <package>` example. |
++| `dsh plugin --help` | Exits nonzero: `error: required option '--profile <name>' not specified`. Confirms `--profile` is mandatory. |
++| `dsh plugin --profile web --help` | **Not verifiable here.** The CLI does not own a `--help` for this command: `--help` is not one of the three DSH-owned verbs, so it is routed to the plugin manager's package operation, which first takes the profile write lock and fails with `EROFS: read-only file system, open '/home/bruno/.dsh/profiles/web/package.json.lock'` — the sandbox denies writes under `$DSH_HOME`. The "pnpm arguments, forwarded verbatim" wording comes from the launcher's own argument definition, whose examples name `add <pkg>`, `remove <pkg>`, and `why <pkg>`. |
++| `dsh --profile web --dump-config` | **Not verifiable here.** Fails with `EROFS: read-only file system, open '/home/bruno/.dsh/profiles/web/cordis.yml'`; profile preparation writes that file. |
++| `dsh plugin --profile web add …` | **Deliberately not run** — installing into a live profile is out of scope for this document. |
++
++Because of those sandbox denials, the following are documented from the shipped
++READMEs and the CLI's own grammar rather than from an executed install: the exact
++GUI button labels, whether `dsh plugin add` selects the bundle the same way the GUI
++does, and all expected `--dump-config` output.
+--- /dev/null
++++ docs/testing.md
+@@ -0,0 +1,217 @@
++# Testing `dsh-opencode-go-usage`
++
++Two layers:
++
++- **Automated** — four Vitest suites that run with no network, no DSH runtime, and no
++  DOM. Every seam (the cache clock, the upstream `fetch`, the provider loader,
++  `admit`) is injected, so the whole request lifecycle is exercised with fakes.
++- **Manual live** — a checklist that needs a running `dsh web` and a real OpenCode
++  Go key, derived from `PLAN.md` §6.4.
++
++All commands below are the package's own scripts or explicitly named external
++commands (`pnpm`, `dsh`, `curl`, `node`). Unexpected results are noted where the exit
++code is easy to misread.
++
++## Unit suites
++
++| Suite | Covers |
++|---|---|
++| `src/cache.test.ts` | TTL hit/expiry, concurrent single-flight dedupe, the 5 s refresh floor, and fail-closed clearing of the cache on `key-missing` / `key-invalid` |
++| `src/quota-parse.test.ts` | Window validator boundaries: `percent` 0 and 100, out-of-range and non-finite percentages, unknown `status`, `rate-limited` over a low `percent`, missing/unparseable `resetsAt`, missing window keys, extra keys ignored |
++| `src/route.test.ts` | Provider error mapping (`401`/`403` → `key-invalid`, `404` → `not-found`, `5xx` → `http`, non-JSON → `parse`, transport → `network`); `admit` refusal passthrough; cached and forced reads; `405`/`404`; the credential/raw-body leak scan; and the admission-throw guard |
++| `src/client/usage-view.test.ts` | The browser half's pure view model: percentage and countdown formatting, severity grading, error copy, envelope projection, and the route-literal drift guard |
++
++No suite imports the DSH runtime or opens a socket, so they are safe to run offline
++and in CI.
++
++### Focused runs
++
++```bash
++pnpm exec vitest run src/route.test.ts          # one suite
++pnpm exec vitest run src/client/usage-view.test.ts
++pnpm exec vitest run -t 'drift guard'           # one test by name
++```
++
++### Why `vitest.config.ts` exists
++
++Test discovery is confined to this package. The repository that built this plugin
++keeps orchestrator artifacts under `.agents/plans/`, including *snapshot copies of
++test files from earlier revisions*; the default test-file glob would collect those
++stale copies and report phantom `Cannot find module './cache.js'` failures from
++directories that are not part of the build. `vitest.config.ts` therefore extends the
++built-in excludes with `**/.agents/**`, keeping the run at **exactly four files**:
++
++```bash
++pnpm exec vitest run
++#  ✓ src/cache.test.ts
++#  ✓ src/quota-parse.test.ts
++#  ✓ src/client/usage-view.test.ts
++#  ✓ src/route.test.ts
++#  Test Files  4 passed (4)
++```
++
++If a fifth file appears that you did not add on purpose, it is a stray copy
++somewhere outside `src/` — move or delete it rather than widening the exclude.
++
++## Full gates
++
++```bash
++pnpm install          # external command; installs the pinned peers/dev-deps
++pnpm run typecheck    # tsc --noEmit — the peer/slot contract drift guard
++pnpm run test         # vitest run --passWithNoTests
++pnpm run build        # tsdown + scripts/wrap-client.mjs
++pnpm run verify       # typecheck && test && build
++pnpm run clean        # rm -rf lib coverage — deletes build output
++```
++
++`pnpm run verify` is the one command that must pass before any change is considered
++done. `pnpm run typecheck` is not cosmetic: the dev-dependencies pin the installed
++DSH peers (`dsh-host-webserver`, `dsh-client-connection`, `dsh-credentials`,
++`dsh-client-ui-*`), so a slot-contract or `admit()` signature change in a future DSH
++release fails here instead of at runtime.
++
++> `pnpm run clean` removes `lib/`. Always re-run `pnpm run build` (or
++> `pnpm run verify`) afterwards; an unbuilt package has no host half and no browser
++> bundle for DSH to load.
++
++## Build assertions
++
++`pnpm run build` must emit the artifacts DSH resolves. The **four** required by the
++manifest are asserted by:
++
++```bash
++for f in lib/index.js lib/index.d.ts lib/client.js lib/client.js.map; do
++  test -f "$f" || { echo "MISSING $f"; exit 1; }
++  echo "present $f"
++done
++```
++
++Expected output (the build also emits `lib/index.js.map`, which is why `lib/`
++contains five files):
++
++```
++present lib/index.js
++present lib/index.d.ts
++present lib/client.js
++present lib/client.js.map
++```
++
++The loop exits nonzero on the first missing artifact, so it works as a gate.
++
++`lib/client.js` is wrapped by `scripts/wrap-client.mjs` into DSH's browser module
++facade, and the wrapper is part of the contract — assert it:
++
++```bash
++head -c 40 lib/client.js
++# window.__ModuleLoader__.load({
++# 	id: "dsh
++
++grep -c '@deepseek-ai/' lib/client.js
++# 0     ← expected; note grep exits 1 when the count is 0
++
++grep -oE 'require\("[^"]+"\)' lib/client.js | sort -u
++# require("react")
++# require("react/jsx-runtime")
++```
++
++Three properties this pins, each a real failure mode:
++
++1. **The wrapper ran.** The file must begin with `window.__ModuleLoader__.load({`
++   — a raw CJS bundle was not wrapped and the browser facade cannot load it.
++2. **No host package leaked into the browser bundle.** `@deepseek-ai/*` is not
++   resolvable in the browser module graph; any such `require` would fail at load.
++   This assertion also proves the node-side drift-guard import in
++   `src/client/usage-view.test.ts` (which imports `src/route.ts`) stayed out of the
++   bundle: a test file is not an entry point, but this checks it rather than
++   assuming it.
++3. **Only the two platform-baseline modules are externalised.** The browser facade
++   resolves `react` and `react/jsx-runtime` only — there is no `dsh.client.external`
++   escape hatch, so anything else must be bundled, not required.
++
++## Manual live checklist
++
++Requires a running GUI (`dsh web`) with the plugin installed
++([docs/install.md](install.md)) and a real OpenCode Go credential. **Not executed
++while writing this document** — no live profile was touched.
++
++### 0. Compare against the upstream endpoint directly
++
++The plugin's reading must agree with what the provider reports. This prints the
++percent-only body; it never prints the key:
++
++```bash
++curl -sS \
++  -H "Authorization: Bearer $OPENCODE_GO_API_KEY" \
++  https://opencode.ai/zen/go/v1/usage | head -c 400
++```
++
++Expected shape (values are volatile; only the shape is contractual):
++
++```json
++{"usage":{"rolling":{"status":"ok","percent":1,"resetsAt":"…"},
++          "weekly":{"status":"ok","percent":19,"resetsAt":"…"},
++          "monthly":{"status":"ok","percent":30,"resetsAt":"…"}}}
++```
++
++Uses the shell's `$OPENCODE_GO_API_KEY`, or whatever name is set in `apiKeyEnv` — a
++placeholder, never a literal. **Do not add `-v`, `--trace`, or `--trace-ascii`** to
++this call: those print request headers, including `Authorization`. The full contract
++and its evidence are in
++[opencode-go-usage-api.md](opencode-go-usage-api.md).
++
++### 1. The widget renders
++
++The indicator appears at the **sidebar foot** (wide sidebar and collapsed rail). The
++popover lists the three windows with a reset countdown each, matching the
++`resetsAt` values from step 0.
++
++### 2. Refresh is throttled, not amplified
++
++Click **Refresh**: the reading updates. Click it twice in rapid succession: the host
++serves the current reading for the second click instead of making a second provider
++request — the anti-spam floor is **5 s** (`DEFAULT_MIN_REFRESH_MS`), and the popover
++keeps the previous snapshot rather than blanking.
++
++### 3. `key-missing` names the reference
++
++Unset the reference — remove it from the credential store, or start the harness
++without the environment variable — then restart `dsh web`. The popover reports that
++no key is configured **and names the `apiKeyEnv` reference**, never a value.
++
++### 4. Provider failures are classified
++
++Point `usageUrl` at a local fixture and reload:
++
++- a fixture answering `401` → the widget reports the key was rejected
++  (`key-invalid`), and any cached reading is dropped;
++- a fixture answering a `rate-limited` window → alert styling and the
++  `limitReached` state;
++- a fixture answering non-JSON → `parse`, with the last good snapshot still shown
++  and marked **stale**.
++
++### 5. No unauthenticated reads
++
++```bash
++curl -i http://127.0.0.1:3080/__dsh_opencode_go_usage__/usage
++```
++
++Expected: `401`/`403`. The status comes from the browser-trust admission check and is
++passed through verbatim. A `200` here is a bug: it means the route is readable
++without a session.
++
++## Troubleshooting
++
++| Symptom | Likely cause | Fix |
++|---|---|---|
++| No indicator at the sidebar foot | The bundle is **not selected** (the dependency is installed but `dsh.profile.bundles` does not list `dsh-opencode-go-usage`) | Check `dsh --profile web --dump-config` for the row, or the **Plugins** page; select the bundle. See [docs/install.md](install.md#manual-fallback) |
++| No indicator, row *is* composed | `lib/client.js` missing — the package was installed without building | `pnpm run build` in the package, then restart/reload |
++| No indicator after a successful install | A running profile did not recompose (no HMR), or the client module graph was not reloaded | Restart `dsh web`. Package *replacements* always need a fresh process |
++| Route answers `401`/`403` | The request has no valid browser session (no session cookie), or it came from an origin the host does not trust | Call the route from the loaded GUI; for a remote origin review the host's browser-trust settings (loopback / trusted hosts) |
++| Popover says no API key is configured (`key-missing`) | The reference named by `apiKeyEnv` is absent from `$DSH_HOME/.credentials.yaml` → `refs`, is empty, or `apiKeyEnv` is not a valid reference name | Confirm presence without printing the value ([docs/install.md](install.md#confirm-the-reference-is-present-without-printing-the-secret)), then store the key or fix the name |
++| Popover says the configured key was rejected (`key-invalid`) | The provider answered `401`/`403`: revoked, expired, or wrong key | Rotate the stored key; the next fetch picks it up with no restart. The cached reading is dropped, not served |
++| Popover says the usage endpoint was not found (`not-found`) | The provider answered `404`: `usageUrl` is wrong, or the undocumented endpoint moved | Re-check `usageUrl` (default `https://opencode.ai/zen/go/v1/usage`). `/zen/go/v1/quota` is a 404 and must not be used |
++| Popover says the usage response could not be read (`parse`) | The upstream shape drifted (no window survived validation) | Compare with the contract in [opencode-go-usage-api.md](opencode-go-usage-api.md); the last good reading stays visible with `stale: true` |
++| A **stale** marker is shown | The endpoint was unreachable or unreadable on the last attempt; the previous snapshot is still being served | Transient: the next fetch clears it. Persistent: check connectivity/proxy for the host running DSH |
++| Refresh does nothing and there is no reading at all | The refresh floor (5 s) has not elapsed and nothing successful has ever loaded; the route answers `{"ok":false,"reason":"http","message":"refresh is throttled; no reading is available yet"}` | Wait out the floor and click again; if it persists, the first load is failing — check the failure reason above |
++| `pnpm exec vitest run` reports more than four files | Stale test copies under `.agents/` (or another stray test outside `src/`) | `vitest.config.ts` already excludes `**/.agents/**`; if it still happens, the extra file is somewhere else — move it under `src/` |
++| `pnpm run typecheck` fails on a slot or `admit()` signature | Installed DSH peers moved outside the declared range (`>=0.1.7-rc.1 <0.3.0`) | Align the dev-dependency versions with the DSH runtime, then re-run `pnpm run verify` |
+--- /dev/null
++++ vitest.config.ts
+@@ -0,0 +1,21 @@
++import { configDefaults, defineConfig } from 'vitest/config'
++
++/**
++ * Test discovery is confined to this package's own sources.
++ *
++ * The orchestrator that built this plugin keeps workflow artifacts (revision
++ * snapshots, review diffs) under `.agents/plans/`. Those snapshots contain
++ * copies of test files from earlier revisions, so the default `**\/*.test.ts`
++ * glob would pick them up and report phantom failures (`Cannot find module
++ * './cache.js'`) from directories that are not part of the build. Excluding
++ * `.agents/**` keeps `pnpm exec vitest run` reporting exactly the four real
++ * suites under `src/`.
++ *
++ * `configDefaults.exclude` is spread first so the built-in ignores
++ * (`node_modules`, `dist`, editor/temp directories, …) stay in effect.
++ */
++export default defineConfig({
++  test: {
++    exclude: [...configDefaults.exclude, '**/.agents/**'],
++  },
++})
+--- a/src/route.test.ts
++++ b/src/route.test.ts
+@@ -349,6 +349,57 @@
+     expect(loader.calls()).toBe(0)
+   })
+ 
++  it('answers a fixed, secret-free 500 when admission itself throws', async () => {
++    // A throwing `admit` is an unexpected internal failure, not a refusal. The
++    // handler must swallow the exception entirely: an escaping throw would
++    // carry its message (here, a credential-shaped token) into the framework's
++    // error path, and echoing the message back would paint it into the widget.
++    const SECRET = 'sk-FAKE-SECRET-VALUE'
++    const THROWN = `admission failed while checking credential ${SECRET}`
++    const FIXED_BODY = '{"ok":false,"reason":"http","status":500,"message":"internal error"}'
++
++    const routes: ReadonlyArray<readonly [string, string]> = [
++      ['GET', USAGE_ROUTE],
++      ['POST', REFRESH_ROUTE],
++    ]
++
++    for (const [method, url] of routes) {
++      const loader = spyLoader(() => okEnvelope())
++      const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
++
++      const response = await call(
++        {
++          cache,
++          loadEnvelope: loader.loadEnvelope,
++          admit: () => {
++            throw new Error(THROWN)
++          },
++        },
++        method,
++        url,
++      )
++
++      expect(response.status).toBe(500)
++      // Byte-for-byte the module's fixed body: no interpolation is possible.
++      expect(response.body).toBe(FIXED_BODY)
++      expect(response.json).toEqual({ ok: false, reason: 'http', status: 500, message: 'internal error' })
++      // Neither the fake token nor any fragment of the thrown message leaks
++      // through the body or through any response header value.
++      expect(response.body).not.toContain(SECRET)
++      expect(response.body).not.toContain('admission failed')
++      expect(response.body).not.toContain('FAKE-SECRET')
++      const headerText = Object.entries(response.headers)
++        .map(([key, value]) => `${key}: ${value}`)
++        .join('\n')
++      expect(headerText).not.toContain(SECRET)
++      expect(headerText).not.toContain('admission failed')
++      // The throw happens before dispatch, so nothing reached the provider or
++      // the cache on either route.
++      expect(loader.calls()).toBe(0)
++      expect(cache.get()).toBeUndefined()
++    }
++  })
++
+   it('serves a fresh cached reading on GET without loading', async () => {
+     const loader = spyLoader(() => okEnvelope('2026-10-10T09:00:00.000Z', 'loaded'))
+     const cache = createSnapshotCache({ ttlMs: 60_000, now: () => 0 })
+--- a/src/client/usage-view.test.ts
++++ b/src/client/usage-view.test.ts
+@@ -4,9 +4,18 @@
+  * No DOM and no real network: the fetch seam is always an injected fake, and
+  * `fetch`/`Response` are only *types* or the platform's in-memory `Response`
+  * implementation, so nothing here opens a socket.
++ *
++ * The one node-side import is `../route.js`, and it exists only to make the
++ * route-literal drift guard below exact: `usage-view.ts` cannot import the
++ * host module (it is node-side and would drag `node:http` and the cache into
++ * the browser bundle), so the two literals are duplicated there and pinned
++ * against the host exports here. This file is a test, never an entry point, so
++ * the import cannot reach `lib/client.js`; `docs/testing.md` records the build
++ * assertion that proves it.
+  */
+ import { describe, expect, it } from 'vitest'
+ import type { QuotaWindow, UsageEnvelope } from '../wire-types.js'
++import { REFRESH_ROUTE, USAGE_ROUTE } from '../route.js'
+ import {
+   describeEnvelope,
+   fetchUsage,
+@@ -85,9 +94,15 @@
+ }
+ 
+ describe('route constants', () => {
+-  it('matches the host routes exactly (drift guard)', () => {
++  it('pins the client literals to the host exports (drift guard)', () => {
++    // The literal route strings are the contract between the two halves. The
++    // expected values are asserted directly so a change to *either* side fails
++    // here, and the host exports are compared so a host-side rename cannot be
++    // mirrored by editing only this file's literals.
+     expect(USAGE_PATH).toBe('/__dsh_opencode_go_usage__/usage')
+     expect(REFRESH_PATH).toBe('/__dsh_opencode_go_usage__/refresh')
++    expect(USAGE_PATH).toBe(USAGE_ROUTE)
++    expect(REFRESH_PATH).toBe(REFRESH_ROUTE)
+   })
+ })
+ 

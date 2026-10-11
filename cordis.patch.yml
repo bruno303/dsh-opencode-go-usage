@@ -1,0 +1,12 @@
+# Bundle patch layer: the row loads the package's main entry as the host half
+# (a plain Cordis plugin whose exported Config IS the `dsh-opencode-go-usage`
+# settings form — DSH identifies a form by the Loader entry id, so the `id`
+# below is the storage namespace and must not change).
+#
+# No config block on purpose: every field has a working default, so a fresh
+# install is usable as-is. Add config under this row only to override something
+# (for example `refreshSeconds: 300`, or a different `usageUrl` if the
+# undocumented upstream endpoint moves).
+- insert:
+    - id: dsh-opencode-go-usage
+      name: dsh-opencode-go-usage

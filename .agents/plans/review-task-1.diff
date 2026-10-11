@@ -1,0 +1,615 @@
+--- /dev/null
++++ package.json
+@@ -0,0 +1,92 @@
++{
++  "name": "dsh-opencode-go-usage",
++  "version": "0.1.0",
++  "description": "DSH web plugin: show OpenCode Go subscription quota usage in the dsh web GUI.",
++  "license": "MIT",
++  "type": "module",
++  "main": "lib/index.js",
++  "types": "lib/index.d.ts",
++  "exports": {
++    ".": {
++      "types": "./lib/index.d.ts",
++      "default": "./lib/index.js"
++    },
++    "./client": "./lib/client.js",
++    "./package.json": "./package.json"
++  },
++  "files": [
++    "lib/index.js",
++    "lib/index.d.ts",
++    "lib/client.js",
++    "lib/client.js.map",
++    "cordis.patch.yml",
++    "README.md",
++    "LICENSE"
++  ],
++  "engines": {
++    "node": ">=20"
++  },
++  "packageManager": "pnpm@12.10.1",
++  "keywords": [
++    "deepseek-harness",
++    "dsh",
++    "cordis",
++    "plugin",
++    "web",
++    "opencode",
++    "usage",
++    "quota"
++  ],
++  "scripts": {
++    "build": "tsdown && node scripts/wrap-client.mjs",
++    "typecheck": "tsc --noEmit",
++    "test": "vitest run --passWithNoTests",
++    "verify": "pnpm run typecheck && pnpm run test && pnpm run build",
++    "clean": "rm -rf lib coverage",
++    "prepack": "pnpm run build"
++  },
++  "dsh": {
++    "manifestVersion": 1,
++    "engines": {
++      "dsh": ">=0.1.7-rc.1 <0.3.0"
++    },
++    "bundle": {
++      "patch": "./cordis.patch.yml"
++    },
++    "client": {
++      "platform": "web",
++      "inject": [
++        "@deepseek-ai/dsh-client-ui-renderer",
++        "@deepseek-ai/dsh-client-ui-layout",
++        "@deepseek-ai/dsh-client-ui-sidebar"
++      ]
++    },
++    "compatibility": {
++      "dshReleases": {
++        "0.2.0-rc.2": "compatible"
++      }
++    }
++  },
++  "peerDependencies": {
++    "@deepseek-ai/cordis": "^4.0.4",
++    "@deepseek-ai/dsh-client-connection": ">=0.1.7-rc.1 <0.3.0",
++    "@deepseek-ai/dsh-credentials": ">=0.1.7-rc.1 <0.3.0",
++    "@deepseek-ai/dsh-host-webserver": ">=0.1.7-rc.1 <0.3.0",
++    "@deepseek-ai/schemastery": "^3.18.4"
++  },
++  "devDependencies": {
++    "@deepseek-ai/cordis": "4.0.4",
++    "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
++    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
++    "@deepseek-ai/schemastery": "3.18.4",
++    "@types/node": "^26.2.0",
++    "@types/react": "^18.3.31",
++    "@types/react-dom": "^18.3.7",
++    "react": "^18.3.1",
++    "react-dom": "^18.3.1",
++    "tsdown": "^0.22.14",
++    "typescript": "^7.0.2",
++    "vitest": "^4.1.11"
++  }
++}
+--- /dev/null
++++ tsconfig.json
+@@ -0,0 +1,23 @@
++{
++  "compilerOptions": {
++    "target": "ES2022",
++    "lib": ["ES2022", "DOM", "DOM.Iterable"],
++    "module": "NodeNext",
++    "moduleResolution": "NodeNext",
++    "jsx": "react-jsx",
++    "types": ["node"],
++    "strict": true,
++    "noEmit": true,
++    "skipLibCheck": true,
++    "esModuleInterop": true,
++    "allowSyntheticDefaultImports": true,
++    "forceConsistentCasingInFileNames": true,
++    "isolatedModules": true,
++    "verbatimModuleSyntax": true,
++    "noUncheckedIndexedAccess": true,
++    "noImplicitOverride": true,
++    "noFallthroughCasesInSwitch": true,
++    "resolveJsonModule": true
++  },
++  "include": ["src", "tsdown.config.ts"]
++}
+--- /dev/null
++++ tsdown.config.ts
+@@ -0,0 +1,58 @@
++import { defineConfig } from 'tsdown'
++
++/**
++ * Two-entry build for a DSH out-of-tree plugin.
++ *
++ * 1. Host half — `src/index.ts` → `lib/index.js` (+ `lib/index.d.ts`, sourcemap).
++ *    Node ESM; every `@deepseek-ai/*` package and node builtin stays external so
++ *    the bundle links against the DSH runtime the host already loaded.
++ *
++ * 2. Client half — `src/client/index.tsx` → a raw CJS intermediate `lib/client.cjs`
++ *    (+ map). `scripts/wrap-client.mjs` turns that intermediate into the final
++ *    `lib/client.js` browser bundle and deletes the intermediate. CJS is required
++ *    because DSH's browser module facade hands the plugin factory a `require`.
++ *
++ * Both halves deliberately keep `@deepseek-ai/*` out of the bundle. The client
++ * half additionally externalises only `react` / `react/jsx-runtime`, which are
++ * the two platform-baseline modules the browser facade can resolve — there is no
++ * `dsh.client.external` escape hatch, so anything else must be bundled.
++ *
++ * The two configs intentionally share `outDir: 'lib'`: only the first run cleans
++ * it, so the second half does not wipe the first half's artifacts.
++ */
++const DSH_PACKAGES = /^@deepseek-ai\//
++
++export default defineConfig([
++  {
++    entry: { index: 'src/index.ts' },
++    outDir: 'lib',
++    format: 'esm',
++    platform: 'node',
++    // The package is `"type": "module"`, so tsdown would otherwise emit
++    // `.mjs` / `.d.mts`. DSH resolves the host half through the package
++    // `exports` map, which names `lib/index.js` and `lib/index.d.ts`.
++    outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
++    dts: true,
++    sourcemap: true,
++    clean: true,
++    deps: { neverBundle: [DSH_PACKAGES] },
++  },
++  {
++    entry: { client: 'src/client/index.tsx' },
++    outDir: 'lib',
++    format: 'cjs',
++    platform: 'browser',
++    // Browser baseline: no Node builtins and no Node-only syntax lowering.
++    target: 'es2022',
++    // The intermediate is consumed by `scripts/wrap-client.mjs`, not shipped.
++    outExtensions: () => ({ js: '.cjs' }),
++    dts: false,
++    sourcemap: true,
++    clean: false,
++    // No code splitting and no dynamic chunks: the wrapper must receive one
++    // self-contained CJS body. (`codeSplitting` is a rolldown output option;
++    // tsdown passes `outputOptions` straight through.)
++    outputOptions: { codeSplitting: false },
++    deps: { neverBundle: ['react', 'react/jsx-runtime'] },
++  },
++])
+--- /dev/null
++++ scripts/wrap-client.mjs
+@@ -0,0 +1,207 @@
++#!/usr/bin/env node
++/**
++ * Wrap the raw CJS client intermediate into the browser bundle DSH loads.
++ *
++ * `tsdown` emits a plain CommonJS module (`lib/client.cjs`, + map). DSH's
++ * browser module facade does not load plain CJS: it loads a bundle that
++ * registers itself on the page-global `window.__ModuleLoader__` and hands the
++ * plugin a `require`. This script performs that last, non-expressible-in-tsdown
++ * step:
++ *
++ *   1. reads the plugin id from `package.json` (single source of truth — never a
++ *      second hardcoded copy),
++ *   2. asserts the compiled body really exports `apply` and is not already
++ *      wrapped, after stripping the intermediate's own `sourceMappingURL`
++ *      comment and a duplicate `Symbol.toStringTag` declaration,
++ *   3. writes `lib/client.js` in the exact facade format,
++ *   4. writes `lib/client.js.map`, offsetting the intermediate's mappings so the
++ *      map stays accurate for the wrapped file (`file` retargeted to
++ *      `client.js`),
++ *   5. deletes the CJS intermediate (and its map).
++ *
++ * Any failed assertion exits non-zero: a broken client bundle makes DSH fail
++ * plugin activation loudly at runtime, which is strictly worse than failing the
++ * build.
++ */
++
++import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { dirname, join } from 'node:path'
++import vm from 'node:vm'
++
++const here = dirname(fileURLToPath(import.meta.url))
++const root = join(here, '..')
++const libDir = join(root, 'lib')
++
++const INTERMEDIATE = join(libDir, 'client.cjs')
++const INTERMEDIATE_MAP = `${INTERMEDIATE}.map`
++const OUTPUT = join(libDir, 'client.js')
++const OUTPUT_MAP = join(libDir, 'client.js.map')
++
++/** Fail loudly with a prefixed message. */
++function fail(message) {
++  console.error(`[wrap-client] ERROR: ${message}`)
++  process.exit(1)
++}
++
++function readJson(path, what) {
++  if (!existsSync(path)) fail(`${what} not found at ${path} (did \`tsdown\` run?)`)
++  try {
++    return JSON.parse(readFileSync(path, 'utf8'))
++  } catch (error) {
++    return fail(`${what} at ${path} is not valid JSON: ${error.message}`)
++  }
++}
++
++// --- 1. identity -----------------------------------------------------------
++
++const pkg = readJson(join(root, 'package.json'), 'package.json')
++if (typeof pkg.name !== 'string' || pkg.name.length === 0) {
++  fail('package.json has no "name"')
++}
++const pluginId = pkg.name
++
++// --- 2. read and validate the compiled body --------------------------------
++
++if (!existsSync(INTERMEDIATE)) {
++  fail(`compiled client intermediate not found at ${INTERMEDIATE}`)
++}
++const rawBody = readFileSync(INTERMEDIATE, 'utf8')
++
++if (rawBody.trim().length === 0) {
++  fail(`compiled client intermediate ${INTERMEDIATE} is empty`)
++}
++
++// The client half must be ONE self-contained module: DSH's facade has no way to
++// load a second chunk. The build sets `outputOptions.codeSplitting: false`; this
++// asserts the result, so a future dynamic import cannot silently emit a chunk
++// the wrapper would drop on the floor.
++const strayChunks = readdirSync(libDir).filter((entry) => entry.endsWith('.cjs') && entry !== 'client.cjs')
++if (strayChunks.length > 0) {
++  fail(
++    `the client build emitted extra CJS chunk(s) ${strayChunks.join(', ')} — ` +
++      `the browser half must bundle to a single file`,
++  )
++}
++
++/**
++ * Normalise the intermediate before wrapping.
++ *
++ * - Drop the intermediate's own `sourceMappingURL` comment. It points at
++ *   `client.cjs.map`, which this script deletes; leaving it would make the
++ *   shipped bundle advertise a map that does not exist. Only a *trailing*
++ *   comment is removed, so no mapped line can shift.
++ * - Drop a leading `Object.defineProperty(exports, Symbol.toStringTag, …)`
++ *   line, because the wrapper header already declares the same thing for the
++ *   same `exports` object. Redefining an identical, non-configurable property
++ *   is legal but noisy. This removal *does* shift every later line up by one,
++ *   so it is counted in `bodyLinesRemoved` and subtracted from the map offset.
++ */
++let body = rawBody.replace(/(?:\r?\n)?[ \t]*\/\/[#@][ \t]*sourceMappingURL=[^\n]*[ \t]*$/, '')
++
++let bodyLinesRemoved = 0
++const TOSTRINGTAG_RE =
++  /^[ \t]*Object\.defineProperty\(exports,\s*Symbol\.toStringTag,\s*\{\s*value:\s*["']Module["']\s*\}\);?[ \t]*\r?\n/
++const duplicateTag = body.match(TOSTRINGTAG_RE)
++if (duplicateTag) {
++  bodyLinesRemoved = (duplicateTag[0].match(/\n/g) ?? []).length
++  body = body.slice(duplicateTag[0].length)
++}
++
++if (body.includes('__ModuleLoader__')) {
++  fail(
++    `compiled client body already references __ModuleLoader__ — it looks pre-wrapped; ` +
++      `the intermediate must be a raw CJS module`,
++  )
++}
++
++/**
++ * The body must export `apply`. Because the exact CJS lowering is the bundler's
++ * business, accept any of the shapes a CJS/ESM-to-CJS lowering produces for a
++ * named `apply` export.
++ */
++const APPLY_EXPORT_PATTERNS = [
++  // exports.apply = apply / exports["apply"] = apply
++  /(?:^|[^\w$.])exports\s*(?:\.\s*apply\b|\[\s*["']apply["']\s*\])/,
++  // module.exports = { ..., apply, ... } (no nested braces before `apply`)
++  /module\s*\.\s*exports\s*=\s*\{[^{}]*\bapply\b[^{}]*\}/,
++  // Object.defineProperty(exports, "apply", ...)
++  /Object\s*\.\s*defineProperty\s*\(\s*exports\s*,\s*["']apply["']/,
++  // ESM named export surviving a non-CJS lowering: export { apply } / export function apply
++  /\bexport\s*\{[^}]*\bapply\b[^}]*\}/,
++  /\bexport\s+(?:async\s+)?function\s+apply\b/,
++]
++
++if (!APPLY_EXPORT_PATTERNS.some((pattern) => pattern.test(body))) {
++  fail(
++    'compiled client body does not appear to export `apply` — ' +
++      'the browser half must export a Cordis `apply` entry point',
++  )
++}
++
++// --- 3. assemble the facade-wrapped bundle ---------------------------------
++
++// NOTE: the body is inserted verbatim, at column 0 and on its own line, so the
++// source map offset below is exact for the whole (unindented) body.
++const header =
++  `window.__ModuleLoader__.load({\n` +
++  `\tid: ${JSON.stringify(pluginId)},\n` +
++  `\tfactory: (require) => {\n` +
++  `\t\tvar module = { exports: {} };\n` +
++  `\t\tvar exports = module.exports;\n` +
++  `\t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });\n`
++
++const footer = `\t\treturn module.exports;\n` + `\t}\n` + `});\n`
++
++// Number of generated lines the body is shifted down by: one per newline in the
++// header, minus the body lines that normalisation removed *before* the first
++// mapped line (the body starts on the line after the last header newline).
++const headerLines = (header.match(/\n/g) ?? []).length
++const lineOffset = headerLines - bodyLinesRemoved
++
++if (headerLines <= 0) fail('internal error: computed a non-positive header line count')
++if (lineOffset < 0) {
++  fail(`internal error: body normalisation removed ${bodyLinesRemoved} lines, more than the header (${headerLines})`)
++}
++
++const bundle = `${header}${body.replace(/\n?$/, '\n')}${footer}\n//# sourceMappingURL=client.js.map\n`
++
++// Parse-only validation: catches a broken concatenation without executing the
++// bundle (which would need `window`, `react`, and the module facade).
++try {
++  new vm.Script(bundle, { filename: 'client.js' })
++} catch (error) {
++  fail(`the wrapped bundle is not valid JavaScript: ${error.message}`)
++}
++
++// --- 4. source map ---------------------------------------------------------
++
++if (!existsSync(INTERMEDIATE_MAP)) {
++  fail(`compiled client sourcemap not found at ${INTERMEDIATE_MAP}`)
++}
++const map = readJson(INTERMEDIATE_MAP, 'client sourcemap')
++
++if (typeof map.mappings !== 'string') {
++  fail('client sourcemap has no "mappings" string')
++}
++
++// One `;` per generated line: prepending `lineOffset` of them shifts every
++// mapping down to where the body now starts. Columns are untouched because the
++// body is inserted verbatim at column 0.
++const wrappedMap = {
++  ...map,
++  file: 'client.js',
++  mappings: ';'.repeat(lineOffset) + map.mappings,
++}
++
++// --- 5. write, then remove the intermediate --------------------------------
++
++writeFileSync(OUTPUT, bundle)
++writeFileSync(OUTPUT_MAP, JSON.stringify(wrappedMap))
++
++rmSync(INTERMEDIATE, { force: true })
++rmSync(INTERMEDIATE_MAP, { force: true })
++
++console.log(
++  `[wrap-client] wrote lib/client.js (id: ${pluginId}, body offset ${lineOffset} lines) and lib/client.js.map`,
++)
+--- /dev/null
++++ cordis.patch.yml
+@@ -0,0 +1,12 @@
++# Bundle patch layer: the row loads the package's main entry as the host half
++# (a plain Cordis plugin whose exported Config IS the `dsh-opencode-go-usage`
++# settings form — DSH identifies a form by the Loader entry id, so the `id`
++# below is the storage namespace and must not change).
++#
++# No config block on purpose: every field has a working default, so a fresh
++# install is usable as-is. Add config under this row only to override something
++# (for example `refreshSeconds: 300`, or a different `usageUrl` if the
++# undocumented upstream endpoint moves).
++- insert:
++    - id: dsh-opencode-go-usage
++      name: dsh-opencode-go-usage
+--- /dev/null
++++ .gitignore
+@@ -0,0 +1,5 @@
++node_modules/
++lib/
++*.log
++.DS_Store
++coverage/
+--- /dev/null
++++ LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 dsh-opencode-go-usage contributors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+--- /dev/null
++++ src/wire-types.ts
+@@ -0,0 +1,63 @@
++/**
++ * Shared, node-safe wire types for the two halves of `dsh-opencode-go-usage`.
++ *
++ * The host half produces these values; the browser half consumes them. This
++ * module must stay free of any runtime import (types only) so it can be pulled
++ * into both the node bundle and the browser bundle without dragging anything in.
++ */
++
++/** Whether a quota window still has headroom, or the provider has cut it off. */
++export type QuotaWindowStatus = 'ok' | 'rate-limited'
++
++/** One quota window as reported by the provider, normalised for the widget. */
++export interface QuotaWindow {
++  /** Stable window key from the provider payload (`rolling`, `weekly`, `monthly`, …). */
++  id: string
++  /** Human-facing short label for the window (for example `5h`, `weekly`). */
++  label: string
++  /** Provider status; `rate-limited` means the window is exhausted regardless of `percentUsed`. */
++  status: QuotaWindowStatus
++  /** Fraction of the window already used, in `[0, 1]`. */
++  percentUsed: number
++  /** ISO-8601 instant at which the window resets. */
++  resetsAt: string
++  /** True when the window is exhausted (`rate-limited` or 100% used). */
++  limitReached: boolean
++}
++
++/** A whole-account usage reading. Never contains credential material. */
++export interface QuotaSnapshot {
++  /** Configured display name of the account/provider. */
++  label: string
++  /** ISO-8601 instant the snapshot was fetched from the provider. */
++  fetchedAt: string
++  /** True when the provider fetch failed and this is the last good reading. */
++  stale: boolean
++  /** True when at least one window is exhausted. */
++  limitReached: boolean
++  /** `id` of the window with the highest `percentUsed`, or `null` when no window parsed. */
++  binding: string | null
++  /** Parsed windows, in provider order. */
++  windows: QuotaWindow[]
++}
++
++/** Why a usage read failed. Never carries a credential value. */
++export type UsageFailureReason =
++  | 'key-missing'
++  | 'key-invalid'
++  | 'not-found'
++  | 'network'
++  | 'parse'
++  | 'http'
++
++/** Result envelope returned by the host route and consumed by the widget. */
++export type UsageEnvelope =
++  | { ok: true; snapshot: QuotaSnapshot }
++  | {
++      ok: false
++      reason: UsageFailureReason
++      /** Upstream HTTP status, when the failure came from a response. */
++      status?: number
++      /** Operator-facing detail. Must never contain credential material. */
++      message?: string
++    }
+--- /dev/null
++++ src/index.ts
+@@ -0,0 +1,77 @@
++import type { Context } from '@deepseek-ai/cordis'
++import Schema from '@deepseek-ai/schemastery'
++
++/**
++ * Host half of `dsh-opencode-go-usage`.
++ *
++ * A plain Cordis plugin. DSH's Loader identifies the settings form by the entry
++ * id (`dsh-opencode-go-usage` in `cordis.patch.yml`), and the exported
++ * {@link Config} schema IS that form — so the field set below is the operator
++ * surface, and no credential value may ever appear in it (only the *name* of the
++ * credential reference).
++ */
++
++/** Loader entry id; also the settings storage namespace. Must not change. */
++export const name = 'dsh-opencode-go-usage'
++
++/**
++ * Host services this plugin needs. Verified against the installed DSH runtime
++ * type declarations (`0.2.0-rc.2`):
++ *
++ * - `webServer` — `@deepseek-ai/dsh-host-webserver` (`lib/types/index.d.ts`),
++ *   declares `webServer: WebServer` on the Cordis `Context`.
++ * - `credentials` — `@deepseek-ai/dsh-credentials` (`lib/types/index.d.ts`),
++ *   declares `credentials: CredentialProvider`.
++ * - `connection` — `@deepseek-ai/dsh-client-connection` (`lib/types/rpc-host.d.ts`),
++ *   declares `connection: HostConnectionHandle` (the browser-trust seam used by
++ *   `admit()`).
++ */
++export const inject = ['webServer', 'credentials', 'connection']
++
++/**
++ * Operator-facing configuration.
++ *
++ * Every field has a working default, so a fresh install is usable as-is; add a
++ * `config:` block under the plugin row only to override something.
++ */
++export const Config = Schema.object({
++  apiKeyEnv: Schema.string()
++    .default('OPENCODE_GO_API_KEY')
++    .description(
++      'Credential reference resolved through the DSH credential seam. This is the *name* of the secret, never its value.',
++    ),
++  usageUrl: Schema.string()
++    .default('https://opencode.ai/zen/go/v1/usage')
++    .description(
++      'OpenCode Go quota endpoint. Undocumented upstream, so it stays configurable in case it moves.',
++    ),
++  displayName: Schema.string()
++    .default('OpenCode Go')
++    .description('Label shown on the usage widget and popover.'),
++  refreshSeconds: Schema.number()
++    .default(60)
++    .description(
++      'How long a fetched snapshot is served before another provider request is made.',
++    ),
++  timeoutMs: Schema.number()
++    .default(10000)
++    .description('Deadline for a single provider request, in milliseconds.'),
++})
++
++/**
++ * Cordis entry point.
++ *
++ * Task 1 stub: it intentionally registers nothing yet. Task 2 adds the
++ * `GET /__dsh_opencode_go_usage__/usage` route (never under the `/api`
++ * namespace, which the connection bridge owns) plus the credentialed fetch and
++ * the TTL cache.
++ *
++ * @param ctx - the plugin context (injects `webServer`, `credentials`, `connection`).
++ * @param rawConfig - the Loader config for this entry, validated against {@link Config}.
++ */
++export async function apply(ctx: Context, rawConfig: unknown): Promise<void> {
++  // Stub: no route registration yet. Referencing the parameters keeps the
++  // declared contract explicit without pretending to use them.
++  void ctx
++  void rawConfig
++}
+--- /dev/null
++++ src/client/index.tsx
+@@ -0,0 +1,27 @@
++import type { Context } from '@deepseek-ai/cordis'
++
++/**
++ * Browser half of `dsh-opencode-go-usage`.
++ *
++ * Loaded by DSH's browser module facade from the wrapped `lib/client.js` bundle
++ * (see `scripts/wrap-client.mjs`). The only modules this half may `require` are
++ * the platform-baseline ones (`react`, `react/jsx-runtime`), which is why the
++ * build externalises exactly those two.
++ */
++
++/** Service the browser half needs to register into a slot. */
++export const inject = ['slots']
++
++/**
++ * Cordis entry point for the browser half.
++ *
++ * Task 1 stub: it intentionally registers nothing yet. Task 3 adds the
++ * `UsageIndicator` registration into the `sidebar.footer.action` slot declared
++ * by `@deepseek-ai/dsh-client-ui-sidebar`.
++ *
++ * @param ctx - the client plugin context (injects `slots`).
++ */
++export function apply(ctx: Context): void {
++  // Stub: no slot registration yet.
++  void ctx
++}
